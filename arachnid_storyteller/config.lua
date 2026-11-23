@@ -17,3 +17,11 @@ Config.Limits = {
   sceneObjective = 1000,
   sceneOrder = 10000
 }
+
+-- A session is a single, server-authoritative live story. The initial runtime
+-- broadcasts scene titles and objectives only; it does not control players.
+Config.Session = {
+  broadcastToPlayers = true,
+  overlayDuration = 12000,
+  requirePublishedStory = true
+}

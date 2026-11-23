@@ -38,6 +38,12 @@ RegisterNetEvent('arachnid_storyteller:select', function(payload)
   end
 end)
 
+RegisterNetEvent('arachnid_storyteller:session', function(payload)
+  if type(payload) == 'table' then
+    SendNUIMessage({ action = 'session', payload = payload })
+  end
+end)
+
 RegisterNetEvent('arachnid_storyteller:denied', function(message)
   TriggerEvent('chat:addMessage', {
     args = { 'Arachnid Storyteller', message or 'You do not have permission to use /STTool.' }
@@ -80,6 +86,35 @@ RegisterNUICallback('sceneDelete', function(data, cb)
     TriggerServerEvent('arachnid_storyteller:sceneDelete', data.id)
   end
   cb({ ok = true })
+end)
+
+RegisterNUICallback('sessionStart', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:sessionStart', data.storyId)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('sessionNext', function(_, cb)
+  if opened then TriggerServerEvent('arachnid_storyteller:sessionNext') end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('sessionSelectScene', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:sessionSelectScene', data.sceneId)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('sessionStop', function(_, cb)
+  if opened then TriggerServerEvent('arachnid_storyteller:sessionStop') end
+  cb({ ok = true })
+end)
+
+CreateThread(function()
+  Wait(1500)
+  TriggerServerEvent('arachnid_storyteller:requestSession')
 end)
 
 AddEventHandler('onResourceStop', function(resource)

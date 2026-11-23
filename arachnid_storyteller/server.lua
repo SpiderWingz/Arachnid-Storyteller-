@@ -1,4 +1,5 @@
 local databaseReady = false
+local activeSession = nil
 local statuses = { draft = true, published = true, archived = true }
 
 MySQL.ready(function()
@@ -90,6 +91,49 @@ local function storyExists(id)
   return type(rows) == 'table' and rows[1] ~= nil
 end
 
+local function sessionPayload(mode)
+  if not activeSession then
+    return { state = 'idle', mode = mode, duration = Config.Session.overlayDuration }
+  end
+  local scene = activeSession.scenes[activeSession.sceneIndex]
+  return {
+    state = 'active',
+    mode = mode,
+    duration = Config.Session.overlayDuration,
+    story = { id = activeSession.storyId, title = activeSession.storyTitle },
+    scene = scene and {
+      id = scene.id,
+      title = scene.title,
+      objective = scene.objective,
+      order = scene.sort_order,
+      x = scene.x,
+      y = scene.y,
+      z = scene.z
+    } or nil,
+    startedAt = activeSession.startedAt,
+    startedBy = activeSession.startedBy
+  }
+end
+
+local function broadcastSession(mode)
+  if Config.Session.broadcastToPlayers then
+    TriggerClientEvent('arachnid_storyteller:session', -1, sessionPayload(mode))
+  end
+end
+
+local function storyForSession(id)
+  local rows = MySQL.query.await('SELECT id,title,status FROM arachnid_storyteller_stories WHERE id=? LIMIT 1', { id })
+  if type(rows) ~= 'table' or not rows[1] then return nil, 'That story no longer exists.' end
+  local story = rows[1]
+  if Config.Session.requirePublishedStory and story.status ~= 'published' then
+    return nil, 'Publish the story before starting a live session.'
+  end
+  local scenes = MySQL.query.await([[SELECT id,title,objective,sort_order,x,y,z
+    FROM arachnid_storyteller_scenes WHERE story_id=? ORDER BY sort_order ASC,id ASC]], { id }) or {}
+  if #scenes == 0 then return nil, 'Add at least one scene beat before starting a session.' end
+  return { id = story.id, title = story.title, scenes = scenes }
+end
+
 local function snapshot()
   local stories = MySQL.query.await([[SELECT id,title,summary,status,created_by,updated_by,created_at,updated_at
     FROM arachnid_storyteller_stories
@@ -105,7 +149,11 @@ local function snapshot()
     story.scenes = scenesByStory[story.id] or {}
     story.scene_count = #story.scenes
   end
-  return { stories = stories, serverTime = os.date('!%Y-%m-%d %H:%M:%S UTC') }
+  return {
+    stories = stories,
+    session = activeSession and sessionPayload('snapshot') or nil,
+    serverTime = os.date('!%Y-%m-%d %H:%M:%S UTC')
+  }
 end
 
 local function sendData(src, open)
@@ -140,6 +188,75 @@ end)
 RegisterNetEvent('arachnid_storyteller:requestData', function()
   local src = source
   if canManage(src) and databaseReady then sendData(src, false) end
+end)
+
+RegisterNetEvent('arachnid_storyteller:requestSession', function()
+  if Config.Session.broadcastToPlayers and activeSession then
+    TriggerClientEvent('arachnid_storyteller:session', source, sessionPayload('sync'))
+  end
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionStart', function(rawStoryId)
+  local src = source
+  if not canManage(src) or not databaseReady then return end
+  local storyId = positiveInteger(rawStoryId)
+  if not storyId then return feedback(src, 'Invalid story identifier.') end
+  if activeSession then return feedback(src, 'A live session is already running. End it before starting another.') end
+  local ok, story, reason = pcall(storyForSession, storyId)
+  if not ok or not story then return feedback(src, 'Session start failed: ' .. tostring(ok and reason or story)) end
+  activeSession = {
+    storyId = story.id,
+    storyTitle = story.title,
+    scenes = story.scenes,
+    sceneIndex = 1,
+    startedAt = os.time(),
+    startedBy = actorName(src)
+  }
+  logAction(src, ('Started live session for story #%s: %s'):format(tostring(story.id), story.title:sub(1, 80)))
+  broadcastSession('started')
+  feedback(src, 'Live session started at scene 1 of ' .. #story.scenes .. '.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionNext', function()
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  if activeSession.sceneIndex >= #activeSession.scenes then
+    return feedback(src, 'The final scene beat is active. End the session when the story is complete.')
+  end
+  activeSession.sceneIndex = activeSession.sceneIndex + 1
+  local scene = activeSession.scenes[activeSession.sceneIndex]
+  logAction(src, ('Advanced live session #%s to scene #%s: %s'):format(
+    tostring(activeSession.storyId), tostring(scene.id), scene.title:sub(1, 80)))
+  broadcastSession('advanced')
+  feedback(src, 'Advanced to scene ' .. activeSession.sceneIndex .. ' of ' .. #activeSession.scenes .. '.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionSelectScene', function(rawSceneId)
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  local sceneId = positiveInteger(rawSceneId)
+  if not sceneId then return feedback(src, 'Invalid scene identifier.') end
+  local targetIndex = nil
+  for index, scene in ipairs(activeSession.scenes) do
+    if tonumber(scene.id) == sceneId then targetIndex = index break end
+  end
+  if not targetIndex then return feedback(src, 'That scene is not part of the active session.') end
+  activeSession.sceneIndex = targetIndex
+  local scene = activeSession.scenes[targetIndex]
+  logAction(src, ('Jumped live session #%s to scene #%s: %s'):format(
+    tostring(activeSession.storyId), tostring(scene.id), scene.title:sub(1, 80)))
+  broadcastSession('jumped')
+  feedback(src, 'Running scene ' .. targetIndex .. ' of ' .. #activeSession.scenes .. '.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionStop', function()
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  local ended = activeSession
+  activeSession = nil
+  logAction(src, ('Ended live session for story #%s: %s'):format(tostring(ended.storyId), ended.storyTitle:sub(1, 80)))
+  broadcastSession('ended')
+  feedback(src, 'Live session ended.')
 end)
 
 RegisterNetEvent('arachnid_storyteller:storySave', function(raw)
@@ -184,6 +301,10 @@ RegisterNetEvent('arachnid_storyteller:storyDelete', function(rawId)
     return rows[1].title
   end)
   if not ok or not title then return feedback(src, 'Story deletion failed: ' .. tostring(ok and reason or title)) end
+  if activeSession and tonumber(activeSession.storyId) == id then
+    activeSession = nil
+    broadcastSession('ended')
+  end
   logAction(src, ('Deleted story #%d and its scene beats: %s'):format(id, tostring(title):sub(1, 80)))
   feedback(src, 'Story and its scene beats deleted.')
 end)
