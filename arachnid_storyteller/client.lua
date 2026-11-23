@@ -112,6 +112,37 @@ RegisterNUICallback('sessionStop', function(_, cb)
   cb({ ok = true })
 end)
 
+RegisterNUICallback('cameraPointCapture', function(data, cb)
+  if opened and type(data) == 'table' then
+    local ped = PlayerPedId()
+    local configuredWeapon = Config.Camera.Tool.weapon
+    if configuredWeapon ~= nil and configuredWeapon ~= '' then
+      local expectedWeapon = type(configuredWeapon) == 'number' and configuredWeapon or GetHashKey(configuredWeapon)
+      if GetSelectedPedWeapon(ped) ~= expectedWeapon then
+        SendNUIMessage({ action = 'feedback', message = 'Equip the configured camera tool before capturing a node.' })
+        cb({ ok = false, error = 'camera_tool_not_equipped' })
+        return
+      end
+    end
+    TriggerServerEvent('arachnid_storyteller:cameraPointCapture', data.sceneId, GetEntityHeading(ped), data.distance)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('cameraPointSave', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:cameraPointSave', data.point)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('cameraPointDelete', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:cameraPointDelete', data.id)
+  end
+  cb({ ok = true })
+end)
+
 CreateThread(function()
   Wait(1500)
   TriggerServerEvent('arachnid_storyteller:requestSession')

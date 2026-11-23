@@ -25,3 +25,29 @@ Config.Session = {
   overlayDuration = 12000,
   requirePublishedStory = true
 }
+
+-- Camera rails are authored as ordered, persistent shot points. Playback and
+-- interpolation deliberately remain a later phase; these settings define safe
+-- capture defaults for the editor now.
+Config.Camera = {
+  captureHeight = 1.6,
+  defaultFov = 75,
+  defaultHoldDuration = 3,
+  defaultTransitionDuration = 2,
+  maxFov = 120,
+  maxHoldDuration = 300,
+  maxTransitionDuration = 60
+}
+
+-- Leave `weapon` empty for panel-only camera-point capture. Set it to a weapon
+-- hash or weapon name to require that the storyteller has that gun/tool equipped
+-- when capturing a point from the panel. The distance slider decides how far
+-- forward from the storyteller the node is saved.
+Config.Camera.Tool = {
+  weapon = '',
+  defaultPlacementDistance = 0,
+  maxPlacementDistance = 75
+}
+
+Config.Limits.cameraLabel = 100
+Config.Limits.cameraMessage = 500

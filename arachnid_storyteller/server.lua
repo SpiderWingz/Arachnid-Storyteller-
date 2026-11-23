@@ -38,6 +38,24 @@ MySQL.ready(function()
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_arachnid_scene_story_order (story_id, sort_order, id)
     )]])
+    MySQL.query.await([[CREATE TABLE IF NOT EXISTS arachnid_storyteller_camera_points (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      scene_id BIGINT UNSIGNED NOT NULL,
+      label VARCHAR(100) NOT NULL,
+      message VARCHAR(500) NOT NULL DEFAULT '',
+      sort_order INT UNSIGNED NOT NULL DEFAULT 1,
+      x DOUBLE NOT NULL,
+      y DOUBLE NOT NULL,
+      z DOUBLE NOT NULL,
+      heading DOUBLE NOT NULL DEFAULT 0,
+      fov DOUBLE NOT NULL DEFAULT 75,
+      hold_duration DOUBLE NOT NULL DEFAULT 3,
+      transition_duration DOUBLE NOT NULL DEFAULT 2,
+      created_by VARCHAR(100) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_arachnid_camera_scene_order (scene_id, sort_order, id)
+    )]])
   end)
   databaseReady = ok
   if not ok then print('[arachnid_storyteller] Database setup failed: ' .. tostring(err)) end
@@ -60,6 +78,12 @@ local function positiveInteger(value)
   local number = tonumber(value)
   if not number or number % 1 ~= 0 or number < 1 then return nil end
   return math.floor(number)
+end
+
+local function boundedNumber(value, minimum, maximum)
+  local number = tonumber(value)
+  if not number or number ~= number or number < minimum or number > maximum then return nil end
+  return number
 end
 
 local function actorName(src)
@@ -89,6 +113,12 @@ end
 local function storyExists(id)
   local rows = MySQL.query.await('SELECT id FROM arachnid_storyteller_stories WHERE id=? LIMIT 1', { id })
   return type(rows) == 'table' and rows[1] ~= nil
+end
+
+local function sceneRecord(id)
+  local rows = MySQL.query.await([[SELECT scenes.id,scenes.story_id
+    FROM arachnid_storyteller_scenes AS scenes WHERE scenes.id=? LIMIT 1]], { id })
+  return type(rows) == 'table' and rows[1] or nil
 end
 
 local function sessionPayload(mode)
@@ -140,8 +170,18 @@ local function snapshot()
     ORDER BY FIELD(status,'published','draft','archived'),updated_at DESC,id DESC]]) or {}
   local scenes = MySQL.query.await([[SELECT id,story_id,title,objective,sort_order,x,y,z,created_by,created_at,updated_at
     FROM arachnid_storyteller_scenes ORDER BY story_id ASC,sort_order ASC,id ASC]]) or {}
+  local cameraPoints = MySQL.query.await([[SELECT id,scene_id,label,message,sort_order,x,y,z,heading,fov,hold_duration,
+    transition_duration,created_by,created_at,updated_at FROM arachnid_storyteller_camera_points
+    ORDER BY scene_id ASC,sort_order ASC,id ASC]]) or {}
+  local camerasByScene = {}
+  for _, point in ipairs(cameraPoints) do
+    camerasByScene[point.scene_id] = camerasByScene[point.scene_id] or {}
+    camerasByScene[point.scene_id][#camerasByScene[point.scene_id] + 1] = point
+  end
   local scenesByStory = {}
   for _, scene in ipairs(scenes) do
+    scene.camera_points = camerasByScene[scene.id] or {}
+    scene.camera_point_count = #scene.camera_points
     scenesByStory[scene.story_id] = scenesByStory[scene.story_id] or {}
     scenesByStory[scene.story_id][#scenesByStory[scene.story_id] + 1] = scene
   end
@@ -152,6 +192,11 @@ local function snapshot()
   return {
     stories = stories,
     session = activeSession and sessionPayload('snapshot') or nil,
+    camera = {
+      defaultPlacementDistance = Config.Camera.Tool.defaultPlacementDistance,
+      maxPlacementDistance = Config.Camera.Tool.maxPlacementDistance,
+      toolConfigured = Config.Camera.Tool.weapon ~= ''
+    },
     serverTime = os.date('!%Y-%m-%d %H:%M:%S UTC')
   }
 end
@@ -194,6 +239,94 @@ RegisterNetEvent('arachnid_storyteller:requestSession', function()
   if Config.Session.broadcastToPlayers and activeSession then
     TriggerClientEvent('arachnid_storyteller:session', source, sessionPayload('sync'))
   end
+end)
+
+RegisterNetEvent('arachnid_storyteller:cameraPointCapture', function(rawSceneId, rawHeading, rawDistance)
+  local src = source
+  if not canManage(src) or not databaseReady then return end
+  local sceneId = positiveInteger(rawSceneId)
+  if not sceneId then return feedback(src, 'Invalid scene identifier.') end
+  local heading = boundedNumber(rawHeading, -720, 720) or 0
+  local distance = boundedNumber(rawDistance, 0, Config.Camera.Tool.maxPlacementDistance)
+  if distance == nil then distance = Config.Camera.Tool.defaultPlacementDistance end
+  local ok, point, reason = pcall(function()
+    local scene = sceneRecord(sceneId)
+    if not scene then return nil, 'That scene no longer exists.' end
+    local position = currentPosition(src)
+    if not position then return nil, 'Current position is unavailable. Ensure OneSync is enabled and try again.' end
+    heading = heading % 360
+    local radians = math.rad(heading)
+    position.x = position.x + math.sin(radians) * distance
+    position.y = position.y + math.cos(radians) * distance
+    position.z = position.z + Config.Camera.captureHeight
+    local rows = MySQL.query.await('SELECT COALESCE(MAX(sort_order),0) AS max_order FROM arachnid_storyteller_camera_points WHERE scene_id=?', { sceneId })
+    local sortOrder = ((rows and rows[1] and tonumber(rows[1].max_order)) or 0) + 1
+    local id = MySQL.insert.await([[INSERT INTO arachnid_storyteller_camera_points
+      (scene_id,label,message,sort_order,x,y,z,heading,fov,hold_duration,transition_duration,created_by)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)]], {
+      sceneId, 'Shot ' .. sortOrder, '', sortOrder, position.x, position.y, position.z, heading,
+      Config.Camera.defaultFov, Config.Camera.defaultHoldDuration, Config.Camera.defaultTransitionDuration, actorName(src)
+    })
+    MySQL.update.await('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actorName(src), scene.story_id })
+    return { id = id, sceneId = sceneId, storyId = scene.story_id, distance = distance }
+  end)
+  if not ok or not point then return feedback(src, 'Camera point capture failed: ' .. tostring(ok and reason or point)) end
+  logAction(src, ('Captured camera point #%s for scene #%s at %.1fm'):format(tostring(point.id), tostring(sceneId), point.distance))
+  TriggerClientEvent('arachnid_storyteller:select', src, { storyId = point.storyId, sceneId = point.sceneId, cameraPointId = point.id })
+  feedback(src, ('Camera point %s captured %.1fm ahead.'):format(tostring(point.id), point.distance))
+end)
+
+RegisterNetEvent('arachnid_storyteller:cameraPointSave', function(raw)
+  local src = source
+  if not canManage(src) or not databaseReady or type(raw) ~= 'table' then return end
+  local id = positiveInteger(raw.id)
+  local label = cleanText(raw.label, Config.Limits.cameraLabel, true)
+  local message = cleanText(raw.message or '', Config.Limits.cameraMessage, false)
+  local sortOrder = positiveInteger(raw.sortOrder)
+  local fov = boundedNumber(raw.fov, 15, Config.Camera.maxFov)
+  local holdDuration = boundedNumber(raw.holdDuration, 0, Config.Camera.maxHoldDuration)
+  local transitionDuration = boundedNumber(raw.transitionDuration, 0, Config.Camera.maxTransitionDuration)
+  if not id or not label or message == nil or not sortOrder or not fov or holdDuration == nil or transitionDuration == nil then
+    return feedback(src, 'Camera point label, order, FOV, hold, or transition settings are invalid.')
+  end
+  local ok, point, reason = pcall(function()
+    local rows = MySQL.query.await([[SELECT points.id,points.scene_id,scenes.story_id
+      FROM arachnid_storyteller_camera_points AS points
+      INNER JOIN arachnid_storyteller_scenes AS scenes ON scenes.id=points.scene_id
+      WHERE points.id=? LIMIT 1]], { id })
+    if type(rows) ~= 'table' or not rows[1] then return nil, 'That camera point no longer exists.' end
+    local record = rows[1]
+    MySQL.update.await([[UPDATE arachnid_storyteller_camera_points
+      SET label=?,message=?,sort_order=?,fov=?,hold_duration=?,transition_duration=? WHERE id=?]],
+      { label, message, sortOrder, fov, holdDuration, transitionDuration, id })
+    MySQL.update.await('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actorName(src), record.story_id })
+    return { id = id, sceneId = record.scene_id, storyId = record.story_id }
+  end)
+  if not ok or not point then return feedback(src, 'Camera point save failed: ' .. tostring(ok and reason or point)) end
+  logAction(src, ('Updated camera point #%s: %s'):format(tostring(id), label:sub(1, 80)))
+  TriggerClientEvent('arachnid_storyteller:select', src, { storyId = point.storyId, sceneId = point.sceneId, cameraPointId = point.id })
+  feedback(src, 'Camera point saved.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:cameraPointDelete', function(rawId)
+  local src = source
+  if not canManage(src) or not databaseReady then return end
+  local id = positiveInteger(rawId)
+  if not id then return feedback(src, 'Invalid camera point identifier.') end
+  local ok, point, reason = pcall(function()
+    local rows = MySQL.query.await([[SELECT points.scene_id,points.label,scenes.story_id
+      FROM arachnid_storyteller_camera_points AS points
+      INNER JOIN arachnid_storyteller_scenes AS scenes ON scenes.id=points.scene_id
+      WHERE points.id=? LIMIT 1]], { id })
+    if type(rows) ~= 'table' or not rows[1] then return nil, 'That camera point no longer exists.' end
+    local record = rows[1]
+    MySQL.update.await('DELETE FROM arachnid_storyteller_camera_points WHERE id=?', { id })
+    MySQL.update.await('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actorName(src), record.story_id })
+    return record
+  end)
+  if not ok or not point then return feedback(src, 'Camera point deletion failed: ' .. tostring(ok and reason or point)) end
+  logAction(src, ('Deleted camera point #%s: %s'):format(tostring(id), tostring(point.label):sub(1, 80)))
+  feedback(src, 'Camera point deleted.')
 end)
 
 RegisterNetEvent('arachnid_storyteller:sessionStart', function(rawStoryId)
@@ -296,6 +429,8 @@ RegisterNetEvent('arachnid_storyteller:storyDelete', function(rawId)
   local ok, title, reason = pcall(function()
     local rows = MySQL.query.await('SELECT title FROM arachnid_storyteller_stories WHERE id=? LIMIT 1', { id })
     if type(rows) ~= 'table' or not rows[1] then return nil, 'That story no longer exists.' end
+    MySQL.update.await([[DELETE points FROM arachnid_storyteller_camera_points AS points
+      INNER JOIN arachnid_storyteller_scenes AS scenes ON scenes.id=points.scene_id WHERE scenes.story_id=?]], { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_scenes WHERE story_id=?', { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_stories WHERE id=?', { id })
     return rows[1].title
@@ -372,6 +507,7 @@ RegisterNetEvent('arachnid_storyteller:sceneDelete', function(rawId)
   local ok, scene, reason = pcall(function()
     local rows = MySQL.query.await('SELECT story_id,title FROM arachnid_storyteller_scenes WHERE id=? LIMIT 1', { id })
     if type(rows) ~= 'table' or not rows[1] then return nil, 'That scene no longer exists.' end
+    MySQL.update.await('DELETE FROM arachnid_storyteller_camera_points WHERE scene_id=?', { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_scenes WHERE id=?', { id })
     MySQL.update.await('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actor, rows[1].story_id })
     return rows[1]

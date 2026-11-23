@@ -7,6 +7,7 @@ Arachnid Storyteller is a standalone RedM gamemaster foundation. Its panel takes
 - Create and maintain story arcs with draft, published, and archived status.
 - Build ordered scene beats with objectives.
 - Optionally save a scene beat at the storyteller's server-verified in-game position.
+- Build ordered camera rails for a scene: capture nodes, set their placement distance, and edit FOV, hold, transition, notes, and order.
 - Start one live session from a published story, advance or jump between its beats, and end it explicitly.
 - Announce the active beat to connected players with a temporary narrative overlay.
 - Record all administration actions in MySQL.
@@ -32,8 +33,17 @@ The resource creates these tables automatically at startup:
 - `arachnid_storyteller_stories`
 - `arachnid_storyteller_scenes`
 - `arachnid_storyteller_audit`
+- `arachnid_storyteller_camera_points`
 
 Saving a world location requires server-side player coordinates, so enable OneSync if your RedM setup does not already provide them.
+
+## Camera rails and optional gun tools
+
+Open a saved scene beat in `/STTool`, then use **Capture camera node**. The placement-distance slider controls how far forward from the storyteller the node is saved; its maximum is server-enforced through `Config.Camera.Tool.maxPlacementDistance`.
+
+By default, `Config.Camera.Tool.weapon` is empty and node capture is panel-only. Set it to a RedM weapon hash or name if you want captures to require that weapon/tool to be equipped. The resource does not spawn, grant, or otherwise manage that weapon.
+
+Camera rail playback is not enabled yet. This phase creates and validates the ordered keyframe data first; actual camera interpolation will follow after it is tested in-game.
 
 ## Live-session rules
 
