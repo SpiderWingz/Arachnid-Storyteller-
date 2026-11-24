@@ -18,7 +18,7 @@
   <div id="story-beat"><small id="beat-story"></small><strong id="beat-title"></strong><p id="beat-objective"></p></div>
   <div id="story-objective"><small id="objective-status"></small><strong>Current objective</strong><p id="objective-text"></p></div>
   <script>
-    const app=document.getElementById('app'),content=document.getElementById('content'),storyBeat=document.getElementById('story-beat'),beatStory=document.getElementById('beat-story'),beatTitle=document.getElementById('beat-title'),beatObjective=document.getElementById('beat-objective'),storyObjective=document.getElementById('story-objective'),objectiveStatus=document.getElementById('objective-status'),objectiveText=document.getElementById('objective-text');let state=null,feedback='',selectedStory=null,selectedScene=null,selectedCameraPoint=null,sessionAudienceMode='all',sessionParticipants=[],beatTimer=null;
+    const app=document.getElementById('app'),content=document.getElementById('content'),storyBeat=document.getElementById('story-beat'),beatStory=document.getElementById('beat-story'),beatTitle=document.getElementById('beat-title'),beatObjective=document.getElementById('beat-objective'),storyObjective=document.getElementById('story-objective'),objectiveStatus=document.getElementById('objective-status'),objectiveText=document.getElementById('objective-text');let state=null,feedback='',selectedStory=null,selectedScene=null,selectedCameraPoint=null,sessionAudienceMode='all',sessionParticipants=[],sessionAudienceAreaId=null,beatTimer=null;
     function node(tag,text,cls){const element=document.createElement(tag);if(text!==undefined)element.textContent=String(text);if(cls)element.className=cls;return element}
     function send(action,data={}){return fetch('https://'+GetParentResourceName()+'/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).catch(()=>{})}
     function close(){app.style.display='none';state=null;send('close')}
@@ -46,19 +46,26 @@
       }else{
         sessionCard.append(node('p','Starting a session announces the first scene beat to the audience chosen below.','muted'));
         const start=node('button','Start live session');
-        start.onclick=()=>confirmAction('Start “'+story.title+'” for the chosen audience?',()=>send('sessionStart',{storyId:story.id,audienceMode:sessionAudienceMode,participantIds:sessionParticipants}));
+        start.onclick=()=>confirmAction('Start “'+story.title+'” for the chosen audience?',()=>send('sessionStart',{storyId:story.id,audienceMode:sessionAudienceMode,participantIds:sessionParticipants,areaId:sessionAudienceAreaId}));
         sessionCard.append(start);
       }
       content.append(sessionCard);
       if(!state.session?.state&&story.status==='published'&&scenes.length){
         const audienceCard=node('div',undefined,'card');audienceCard.append(node('h3','Session audience'));
-        const audienceMode=node('select');for(const [id,label] of [['all','All online players'],['selected','Selected players only']]){const option=node('option',label);option.value=id;audienceMode.append(option)}
-        if(!['all','selected'].includes(sessionAudienceMode))sessionAudienceMode='all';audienceMode.value=sessionAudienceMode;
+        const audienceMode=node('select');for(const [id,label] of [['all','All online players'],['selected','Selected players only'],['area','Players inside a saved area']]){const option=node('option',label);option.value=id;audienceMode.append(option)}
+        if(!['all','selected','area'].includes(sessionAudienceMode))sessionAudienceMode='all';audienceMode.value=sessionAudienceMode;
         audienceMode.onchange=()=>{sessionAudienceMode=audienceMode.value;render()};audienceCard.append(audienceMode);
         if(sessionAudienceMode==='selected'){
           const players=state.players||[];audienceCard.append(node('p','Only checked players receive the live beat and objective overlay.','muted'));
           if(!players.length)audienceCard.append(node('p','No online players are available.','muted'));
           for(const player of players){const check=document.createElement('input');check.type='checkbox';check.checked=sessionParticipants.map(Number).includes(Number(player.id));const label=node('label',player.name+' (#'+player.id+')');label.prepend(check);check.onchange=()=>{const id=Number(player.id);const values=new Set(sessionParticipants.map(Number));if(check.checked)values.add(id);else values.delete(id);sessionParticipants=[...values]};audienceCard.append(label)}
+        }else if(sessionAudienceMode==='area'){
+          const areas=state.areas||[],areaPicker=node('select');areaPicker.append(node('option','Choose a saved area'));areaPicker.options[0].value='';
+          for(const area of areas){const option=node('option',area.label+' ('+area.shape+')');option.value=String(area.id);areaPicker.append(option)}
+          if(sessionAudienceAreaId!=null&&!areas.some(area=>String(area.id)===String(sessionAudienceAreaId)))sessionAudienceAreaId=null;
+          areaPicker.value=sessionAudienceAreaId==null?'':String(sessionAudienceAreaId);areaPicker.onchange=()=>{sessionAudienceAreaId=areaPicker.value?Number(areaPicker.value):null};areaPicker.disabled=!areas.length;
+          audienceCard.append(areaPicker,node('p','Players inside this area when the session starts receive its beat and objective updates. Players who move in later are not added.','muted'));
+          if(!areas.length)audienceCard.append(node('p','Create a saved area below before starting an area-targeted session.','muted'));
         }else{audienceCard.append(node('p','Every currently connected player receives the live beat and objective overlay.','muted'))}
         content.append(audienceCard);
       }
@@ -80,6 +87,8 @@
       const sceneList=node('div',undefined,'item-grid');for(const entry of scenes){const card=node('div',undefined,'card');card.append(node('strong',entry.sort_order+'. '+entry.title),node('p',entry.objective||'No objective notes yet.','muted'));const position=entry.x!=null&&entry.y!=null&&entry.z!=null?'Location: '+[entry.x,entry.y,entry.z].map(value=>Number(value).toFixed(2)).join(', '):'No saved world location';card.append(node('p',position,'muted'));const edit=node('button',selectedScene===entry.id?'Editing':'Edit scene');edit.onclick=()=>{selectedScene=entry.id;selectedCameraPoint=null;render()};card.append(edit);if(liveForStory){const run=node('button','Run this beat now');run.onclick=()=>confirmAction('Announce “'+entry.title+'” as the active scene beat?',()=>send('sessionSelectScene',{sceneId:entry.id}));card.append(run)}sceneList.append(card)}content.append(sceneList);if(!scenes.length)content.append(node('p','No scene beats yet. Add one to turn this story arc into a playable plan.','muted'))}
     window.addEventListener('message',event=>{const data=event.data||{};if(data.action==='open'){state=data.payload;feedback='';selectedStory=null;selectedScene=null;selectedCameraPoint=null;showObjective(state.session);app.style.display='flex';render()}else if(data.action==='data'){state=data.payload;showObjective(state.session);render()}else if(data.action==='session'){showSession(data.payload);showObjective(data.payload);if(state){state.session=data.payload?.state==='active'?data.payload:null;render()}}else if(data.action==='feedback'){feedback=data.message||'';render()}else if(data.action==='select'){const choice=data.payload||{};if(choice.storyId!=null)selectedStory=Number(choice.storyId);if(choice.sceneId!=null)selectedScene=Number(choice.sceneId);if(choice.cameraPointId!=null)selectedCameraPoint=Number(choice.cameraPointId)}else if(data.action==='close'){app.style.display='none';state=null}});
     window.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();if(state)close()}});document.getElementById('close').onclick=close;document.getElementById('refresh').onclick=()=>send('refresh');
+    window.ArachnidStoryteller={getState:()=>state,render,send};
   </script>
+  <script src="areas.js"></script>
 </body>
 </html>

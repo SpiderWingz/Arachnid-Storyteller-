@@ -9,7 +9,8 @@ Arachnid Storyteller is a standalone RedM gamemaster foundation. Its panel takes
 - Optionally save a scene beat at the storyteller's server-verified in-game position.
 - Build ordered camera rails for a scene: capture nodes, set their placement distance, and edit FOV, hold, transition, notes, and order.
 - Start one live session from a published story, advance or jump between its beats, and end it explicitly.
-- Choose whether a session reaches everyone online or only an explicit set of online participants.
+- Target a session to everyone online, selected players, or players inside a saved sphere or box.
+- Save, edit, and delete named session areas centered on the storyteller's current in-game position.
 - Announce the active beat to connected players with a temporary narrative overlay.
 - Turn each scene's objective into a persistent player HUD item, then update, complete, or fail it from the gamemaster console.
 - Record all administration actions in MySQL.
@@ -36,6 +37,7 @@ The resource creates these tables automatically at startup:
 - `arachnid_storyteller_scenes`
 - `arachnid_storyteller_audit`
 - `arachnid_storyteller_camera_points`
+- `arachnid_storyteller_areas`
 
 Saving a world location requires server-side player coordinates, so enable OneSync if your RedM setup does not already provide them.
 
@@ -55,3 +57,5 @@ Camera rail playback is not enabled yet. This phase creates and validates the or
 - Set `Config.Session.broadcastToPlayers = false` to keep session controls active without showing the player overlay.
 - Advancing or jumping to another beat resets its live objective to that scene's saved objective; objective completion does not auto-advance the session.
 - Selected-audience sessions send beat and objective updates only to the chosen, currently online players. The server revalidates every selected source and caps the list with `Config.Session.maxParticipants`.
+- Area-audience sessions capture the online players inside the selected region when the session starts. The server checks their current positions, caps the captured list with `Config.Session.maxParticipants`, and does not add players who enter the area later.
+- Spheres use a radius; boxes use width, depth, and height and remain axis-aligned. Area dimensions are checked on the server against `Config.Areas` limits.

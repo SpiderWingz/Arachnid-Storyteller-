@@ -2,6 +2,7 @@ local databaseReady = false
 local activeSession = nil
 local statuses = { draft = true, published = true, archived = true }
 local objectiveStatuses = { active = true, completed = true, failed = true }
+local areaShapes = { sphere = true, box = true }
 
 MySQL.ready(function()
   local ok, err = pcall(function()
@@ -56,6 +57,22 @@ MySQL.ready(function()
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_arachnid_camera_scene_order (scene_id, sort_order, id)
+    )]])
+    MySQL.query.await([[CREATE TABLE IF NOT EXISTS arachnid_storyteller_areas (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      label VARCHAR(100) NOT NULL,
+      shape VARCHAR(16) NOT NULL DEFAULT 'sphere',
+      x DOUBLE NOT NULL,
+      y DOUBLE NOT NULL,
+      z DOUBLE NOT NULL,
+      radius DOUBLE NOT NULL DEFAULT 10,
+      width DOUBLE NOT NULL DEFAULT 10,
+      depth DOUBLE NOT NULL DEFAULT 10,
+      height DOUBLE NOT NULL DEFAULT 10,
+      created_by VARCHAR(100) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_arachnid_area_shape (shape)
     )]])
   end)
   databaseReady = ok
@@ -134,9 +151,55 @@ local function onlinePlayers()
   return players
 end
 
-local function validatedAudience(rawMode, rawIds)
-  local mode = rawMode == 'selected' and 'selected' or 'all'
+local function areaRecord(id)
+  local rows = MySQL.query.await([[SELECT id,label,shape,x,y,z,radius,width,depth,height
+    FROM arachnid_storyteller_areas WHERE id=? LIMIT 1]], { id })
+  return type(rows) == 'table' and rows[1] or nil
+end
+
+local function areaContains(area, position)
+  if not area or not position then return false end
+  local x, y, z = tonumber(area.x), tonumber(area.y), tonumber(area.z)
+  if not x or not y or not z or x ~= x or y ~= y or z ~= z then return false end
+  local dx, dy, dz = position.x - x, position.y - y, position.z - z
+  if area.shape == 'sphere' then
+    local radius = tonumber(area.radius) or 0
+    return (dx * dx) + (dy * dy) + (dz * dz) <= radius * radius
+  end
+  if area.shape ~= 'box' then return false end
+  return math.abs(dx) <= (tonumber(area.width) or 0) / 2
+    and math.abs(dy) <= (tonumber(area.depth) or 0) / 2
+    and math.abs(dz) <= (tonumber(area.height) or 0) / 2
+end
+
+local function participantsInArea(area)
+  local participants = {}
+  for _, player in ipairs(onlinePlayers()) do
+    local position = currentPosition(player.id)
+    if areaContains(area, position) then
+      participants[#participants + 1] = player.id
+      if #participants > Config.Session.maxParticipants then return nil, 'Too many players are inside this area.' end
+    end
+  end
+  if #participants == 0 then return nil, 'No online players are inside the selected area.' end
+  return participants
+end
+
+local function validatedAudience(rawMode, rawIds, rawAreaId)
+  local mode = rawMode == nil and 'all' or type(rawMode) == 'string' and rawMode:lower() or nil
+  if not mode or (mode ~= 'all' and mode ~= 'selected' and mode ~= 'area') then
+    return nil, 'Choose a valid session audience.'
+  end
   if mode == 'all' then return { mode = 'all', participants = {} } end
+  if mode == 'area' then
+    local areaId = positiveInteger(rawAreaId)
+    if not areaId then return nil, 'Choose a valid session area.' end
+    local area = areaRecord(areaId)
+    if not area then return nil, 'That session area no longer exists.' end
+    local participants, reason = participantsInArea(area)
+    if not participants then return nil, reason end
+    return { mode = 'area', participants = participants, areaId = area.id, areaLabel = area.label }
+  end
   if type(rawIds) ~= 'table' then return nil, 'Choose at least one online participant.' end
   local participants, seen = {}, {}
   for _, rawId in ipairs(rawIds) do
@@ -184,7 +247,8 @@ local function sessionPayload(mode, session)
     objective = current.objective,
     audience = {
       mode = current.audience and current.audience.mode or 'all',
-      count = current.audience and current.audience.mode == 'selected' and #(current.audience.participants or {}) or #GetPlayers()
+      count = current.audience and current.audience.mode ~= 'all' and #(current.audience.participants or {}) or #GetPlayers(),
+      areaLabel = current.audience and current.audience.areaLabel or nil
     },
     startedAt = current.startedAt,
     startedBy = current.startedBy
@@ -208,7 +272,7 @@ local function broadcastSession(mode, session)
   if not Config.Session.broadcastToPlayers then return end
   local current = session or activeSession
   local payload = mode == 'ended' and { state = 'idle', mode = mode, duration = Config.Session.overlayDuration } or sessionPayload(mode, current)
-  if current and current.audience and current.audience.mode == 'selected' then
+  if current and current.audience and current.audience.mode ~= 'all' then
     for _, id in ipairs(current.audience.participants or {}) do
       if GetPlayerName(id) then TriggerClientEvent('arachnid_storyteller:session', id, payload) end
     end
@@ -239,6 +303,8 @@ local function snapshot()
   local cameraPoints = MySQL.query.await([[SELECT id,scene_id,label,message,sort_order,x,y,z,heading,fov,hold_duration,
     transition_duration,created_by,created_at,updated_at FROM arachnid_storyteller_camera_points
     ORDER BY scene_id ASC,sort_order ASC,id ASC]]) or {}
+  local areas = MySQL.query.await([[SELECT id,label,shape,x,y,z,radius,width,depth,height,created_by,created_at,updated_at
+    FROM arachnid_storyteller_areas ORDER BY label ASC,id ASC]]) or {}
   local camerasByScene = {}
   for _, point in ipairs(cameraPoints) do
     camerasByScene[point.scene_id] = camerasByScene[point.scene_id] or {}
@@ -259,6 +325,13 @@ local function snapshot()
     stories = stories,
     session = activeSession and sessionPayload('snapshot') or nil,
     players = onlinePlayers(),
+    areas = areas,
+    areaLimits = {
+      minRadius = Config.Areas.minRadius,
+      maxRadius = Config.Areas.maxRadius,
+      minDimension = Config.Areas.minDimension,
+      maxDimension = Config.Areas.maxDimension
+    },
     camera = {
       defaultPlacementDistance = Config.Camera.Tool.defaultPlacementDistance,
       maxPlacementDistance = Config.Camera.Tool.maxPlacementDistance,
@@ -396,13 +469,82 @@ RegisterNetEvent('arachnid_storyteller:cameraPointDelete', function(rawId)
   feedback(src, 'Camera point deleted.')
 end)
 
+RegisterNetEvent('arachnid_storyteller:areaSave', function(raw)
+  local src = source
+  if not canManage(src) or not databaseReady or type(raw) ~= 'table' then return end
+  local id = nil
+  if raw.id ~= nil and raw.id ~= '' then id = positiveInteger(raw.id) end
+  local label = cleanText(raw.label, Config.Limits.areaLabel, true)
+  local shape = type(raw.shape) == 'string' and raw.shape:lower() or nil
+  local radius, width, depth, height
+  if shape == 'sphere' then
+    radius = boundedNumber(raw.radius, Config.Areas.minRadius, Config.Areas.maxRadius)
+    if radius then width, depth, height = radius * 2, radius * 2, radius * 2 end
+  elseif shape == 'box' then
+    width = boundedNumber(raw.width, Config.Areas.minDimension, Config.Areas.maxDimension)
+    depth = boundedNumber(raw.depth, Config.Areas.minDimension, Config.Areas.maxDimension)
+    height = boundedNumber(raw.height, Config.Areas.minDimension, Config.Areas.maxDimension)
+    radius = 0
+  end
+  if not label or not areaShapes[shape] or not radius or not width or not depth or not height or
+    (raw.id ~= nil and raw.id ~= '' and not id) then
+    return feedback(src, 'Area label, shape, dimensions, or identifier are invalid.')
+  end
+  local position = currentPosition(src)
+  if not position then
+    return feedback(src, 'Current position is unavailable. Ensure OneSync is enabled and try again.')
+  end
+  local actor = actorName(src)
+  local ok, result, action = pcall(function()
+    if id then
+      if not areaRecord(id) then return nil, 'That area no longer exists.' end
+      MySQL.update.await([[UPDATE arachnid_storyteller_areas
+        SET label=?,shape=?,x=?,y=?,z=?,radius=?,width=?,depth=?,height=? WHERE id=?]], {
+        label, shape, position.x, position.y, position.z, radius, width, depth, height, id
+      })
+      return id, 'updated'
+    end
+    local newId = MySQL.insert.await([[INSERT INTO arachnid_storyteller_areas
+      (label,shape,x,y,z,radius,width,depth,height,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)]], {
+      label, shape, position.x, position.y, position.z, radius, width, depth, height, actor
+    })
+    return newId, 'created'
+  end)
+  if not ok or not result then return feedback(src, 'Area save failed: ' .. tostring(ok and action or result)) end
+  logAction(src, ('%s %s area #%s at %.2f, %.2f, %.2f: %s'):format(
+    action, shape, tostring(result), position.x, position.y, position.z, label:sub(1, 80)))
+  TriggerClientEvent('arachnid_storyteller:select', src, { areaId = result })
+  feedback(src, 'Area ' .. action .. '.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:areaDelete', function(rawId)
+  local src = source
+  if not canManage(src) or not databaseReady then return end
+  local id = positiveInteger(rawId)
+  if not id then return feedback(src, 'Invalid area identifier.') end
+  local ok, area, reason = pcall(function()
+    local record = areaRecord(id)
+    if not record then return nil, 'That area no longer exists.' end
+    MySQL.update.await('DELETE FROM arachnid_storyteller_areas WHERE id=?', { id })
+    return record
+  end)
+  if not ok or not area then return feedback(src, 'Area deletion failed: ' .. tostring(ok and reason or area)) end
+  logAction(src, ('Deleted %s area #%s: %s'):format(tostring(area.shape), tostring(id), tostring(area.label):sub(1, 80)))
+  feedback(src, 'Area deleted.')
+end)
+
 RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
   local src = source
   if not canManage(src) or not databaseReady then return end
   local storyId = positiveInteger(type(raw) == 'table' and raw.storyId or raw)
   if not storyId then return feedback(src, 'Invalid story identifier.') end
   if activeSession then return feedback(src, 'A live session is already running. End it before starting another.') end
-  local audience, audienceError = validatedAudience(type(raw) == 'table' and raw.audienceMode or 'all', type(raw) == 'table' and raw.participantIds or nil)
+  local audienceOk, audience, audienceError = pcall(validatedAudience,
+    type(raw) == 'table' and raw.audienceMode or 'all',
+    type(raw) == 'table' and raw.participantIds or nil,
+    type(raw) == 'table' and raw.areaId or nil
+  )
+  if not audienceOk then return feedback(src, 'Audience validation failed: ' .. tostring(audience)) end
   if not audience then return feedback(src, audienceError) end
   local ok, story, reason = pcall(storyForSession, storyId)
   if not ok or not story then return feedback(src, 'Session start failed: ' .. tostring(ok and reason or story)) end
@@ -495,7 +637,7 @@ RegisterNetEvent('arachnid_storyteller:sessionObjectiveStatus', function(rawStat
 end)
 
 AddEventHandler('playerDropped', function()
-  if not activeSession or not activeSession.audience or activeSession.audience.mode ~= 'selected' then return end
+  if not activeSession or not activeSession.audience or activeSession.audience.mode == 'all' then return end
   local leaving = tonumber(source)
   for index = #activeSession.audience.participants, 1, -1 do
     if tonumber(activeSession.audience.participants[index]) == leaving then

@@ -53,3 +53,11 @@ Config.Camera.Tool = {
 Config.Limits.cameraLabel = 100
 Config.Limits.cameraMessage = 500
 Config.Limits.activeObjective = 1000
+Config.Limits.areaLabel = 100
+
+Config.Areas = {
+  minRadius = 1,
+  maxRadius = 500,
+  minDimension = 1,
+  maxDimension = 1000
+}

@@ -157,6 +157,20 @@ RegisterNUICallback('cameraPointDelete', function(data, cb)
   cb({ ok = true })
 end)
 
+RegisterNUICallback('areaSave', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:areaSave', data.area)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('areaDelete', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:areaDelete', data.id)
+  end
+  cb({ ok = true })
+end)
+
 CreateThread(function()
   Wait(1500)
   TriggerServerEvent('arachnid_storyteller:requestSession')
