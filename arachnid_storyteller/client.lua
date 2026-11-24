@@ -2,6 +2,10 @@ local opened = false
 local activeCutscene = nil
 local activeStorySounds = {}
 local activeShakeToken = 0
+local activeWeaponPickups = {}
+local activeRtsPossession = nil
+local possessionRestoreFrozen = false
+local reopenAfterPossession = false
 
 local function stopCutscene()
   local playback = activeCutscene
@@ -162,6 +166,111 @@ RegisterNetEvent('arachnid_storyteller:open', function(payload)
   SendNUIMessage({ action = 'open', payload = payload })
 end)
 
+local function endRtsPossession(requestServerRelease)
+  local state = activeRtsPossession
+  if not state then return end
+  activeRtsPossession = nil
+  if state.camera and DoesCamExist(state.camera) then
+    RenderScriptCams(false, false, 0, true, true)
+    DestroyCam(state.camera, false)
+  end
+  local playerPed = PlayerPedId()
+  if playerPed and playerPed ~= 0 then FreezeEntityPosition(playerPed, possessionRestoreFrozen == true) end
+  TriggerServerEvent('arachnid_storyteller:rtsPossessionAttack', false)
+  if requestServerRelease then TriggerServerEvent('arachnid_storyteller:rtsPossessionRelease') end
+  if reopenAfterPossession then
+    reopenAfterPossession = false
+    SetTimeout(250, function() TriggerServerEvent('arachnid_storyteller:requestOpen') end)
+  end
+end
+
+RegisterNetEvent('arachnid_storyteller:rtsPossessionStart', function(payload)
+  if type(payload) ~= 'table' or activeRtsPossession then return end
+  reopenAfterPossession = opened
+  opened = false
+  SetNuiFocus(false, false)
+  if type(SetNuiFocusKeepInput) == 'function' then SetNuiFocusKeepInput(false) end
+  SendNUIMessage({ action = 'close' })
+  CreateThread(function()
+    local netId = tonumber(payload.networkId)
+    local entity = netId and NetworkGetEntityFromNetworkId(netId) or 0
+    local deadline = GetGameTimer() + 5000
+    while (not entity or entity == 0 or not DoesEntityExist(entity)) and GetGameTimer() < deadline do
+      Wait(100)
+      entity = netId and NetworkGetEntityFromNetworkId(netId) or 0
+    end
+    if not entity or entity == 0 or not DoesEntityExist(entity) then
+      TriggerServerEvent('arachnid_storyteller:rtsPossessionRelease')
+      if reopenAfterPossession then SetTimeout(250, function() TriggerServerEvent('arachnid_storyteller:requestOpen') end); reopenAfterPossession = false end
+      return
+    end
+    if type(NetworkRequestControlOfEntity) == 'function' and type(NetworkHasControlOfEntity) == 'function' then
+      local controlDeadline = GetGameTimer() + 5000
+      NetworkRequestControlOfEntity(entity)
+      while not NetworkHasControlOfEntity(entity) and GetGameTimer() < controlDeadline do
+        Wait(50)
+        NetworkRequestControlOfEntity(entity)
+      end
+      if not NetworkHasControlOfEntity(entity) then
+        TriggerServerEvent('arachnid_storyteller:rtsPossessionRelease')
+        if reopenAfterPossession then SetTimeout(250, function() TriggerServerEvent('arachnid_storyteller:requestOpen') end); reopenAfterPossession = false end
+        return
+      end
+    end
+    local playerPed = PlayerPedId()
+    possessionRestoreFrozen = playerPed and playerPed ~= 0 and type(IsEntityPositionFrozen) == 'function' and IsEntityPositionFrozen(playerPed) or false
+    if playerPed and playerPed ~= 0 then FreezeEntityPosition(playerPed, true) end
+    local camera = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
+    AttachCamToEntity(camera, entity, 0.0, -4.0, 2.0, true)
+    SetCamRot(camera, -8.0, 0.0, GetEntityHeading(entity), 2)
+    SetCamActive(camera, true)
+    RenderScriptCams(true, false, 0, true, true)
+    activeRtsPossession = { entity = entity, npcId = payload.npcId, targetPlayerId = tonumber(payload.targetPlayerId), camera = camera, moveSpeed = tonumber(payload.moveSpeed) or 1.5 }
+    local yaw = GetEntityHeading(entity) or 0.0
+    local lastMoveAt, attacking = 0, false
+    while activeRtsPossession and activeRtsPossession.entity == entity do
+      DisableAllControlActions(0)
+      if IsDisabledControlJustPressed(0, 0x156F7119) or IsDisabledControlJustPressed(0, 0xCEFD9220) then
+        endRtsPossession(true)
+        break
+      end
+      local lookX = GetDisabledControlNormal(0, 0xA987235F)
+      local lookY = GetDisabledControlNormal(0, 0xD2047988)
+      yaw = (yaw - lookX * 5.0) % 360.0
+      local pitch = math.max(-35.0, math.min(15.0, GetCamRot(camera, 2).x - lookY * 4.0))
+      SetCamRot(camera, pitch, 0.0, yaw, 2)
+      if IsDisabledControlJustPressed(0, 0x07CE1E61) and not attacking then
+        attacking = true
+        TriggerServerEvent('arachnid_storyteller:rtsPossessionAttack', true)
+      elseif IsDisabledControlJustReleased(0, 0x07CE1E61) and attacking then
+        attacking = false
+        TriggerServerEvent('arachnid_storyteller:rtsPossessionAttack', false)
+      end
+      local forward = (IsDisabledControlPressed(0, 0x8FD015D8) and 1 or 0) - (IsDisabledControlPressed(0, 0xD27782E3) and 1 or 0)
+      local lateral = (IsDisabledControlPressed(0, 0xB4E465B4) and 1 or 0) - (IsDisabledControlPressed(0, 0x7065027D) and 1 or 0)
+      if (forward ~= 0 or lateral ~= 0) and GetGameTimer() - lastMoveAt >= 250 and NetworkHasControlOfEntity(entity) then
+        local radians = math.rad(yaw)
+        local fx, fy = -math.sin(radians), math.cos(radians)
+        local rx, ry = math.cos(radians), math.sin(radians)
+        local dx, dy = fx * forward + rx * lateral, fy * forward + ry * lateral
+        local length = math.sqrt(dx * dx + dy * dy)
+        if length > 0 then
+          local coords = GetEntityCoords(entity)
+          local scale = 5.0 / length
+          TaskGoStraightToCoord(entity, coords.x + dx * scale, coords.y + dy * scale, coords.z, activeRtsPossession.moveSpeed, 300, yaw, 0.5)
+          SetEntityHeading(entity, yaw)
+          lastMoveAt = GetGameTimer()
+        end
+      end
+      Wait(0)
+    end
+  end)
+end)
+
+RegisterNetEvent('arachnid_storyteller:rtsPossessionStop', function()
+  endRtsPossession(false)
+end)
+
 RegisterNetEvent('arachnid_storyteller:data', function(payload)
   if opened and type(payload) == 'table' then
     SendNUIMessage({ action = 'data', payload = payload })
@@ -194,6 +303,46 @@ end)
 
 RegisterNetEvent('arachnid_storyteller:rtsSnapshot', function(payload)
   if opened and type(payload) == 'table' then SendNUIMessage({ action = 'rtsSnapshot', payload = payload }) end
+end)
+
+RegisterNetEvent('arachnid_storyteller:weaponPickups', function(payload)
+  activeWeaponPickups = type(payload) == 'table' and payload or {}
+end)
+
+RegisterNetEvent('arachnid_storyteller:weaponPickupGrant', function(payload)
+  if type(payload) ~= 'table' or type(payload.weapon) ~= 'string' then return end
+  local ped = PlayerPedId()
+  if not ped or ped == 0 or type(GiveWeaponToPed) ~= 'function' then return end
+  GiveWeaponToPed(ped, GetHashKey(payload.weapon), tonumber(payload.ammo) or 0, false, true)
+  TriggerEvent('chat:addMessage', { args = { 'Arachnid Storyteller', 'Picked up ' .. payload.weapon .. '.' } })
+end)
+
+CreateThread(function()
+  Wait(2000)
+  TriggerServerEvent('arachnid_storyteller:requestWeaponPickups')
+  while true do
+    local nearest, nearestDistance
+    if #activeWeaponPickups > 0 then
+      local ped = PlayerPedId()
+      local position = ped and ped ~= 0 and GetEntityCoords(ped) or nil
+      if position then
+        for _, pickup in ipairs(activeWeaponPickups) do
+          local dx, dy, dz = position.x - (tonumber(pickup.x) or 0), position.y - (tonumber(pickup.y) or 0), position.z - (tonumber(pickup.z) or 0)
+          local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+          if distance <= 2.0 and (not nearestDistance or distance < nearestDistance) then nearest, nearestDistance = pickup, distance end
+        end
+      end
+    end
+    if nearest then
+      BeginTextCommandDisplayHelp('STRING')
+      AddTextComponentSubstringPlayerName(('Press ~INPUT_CONTEXT~ to pick up %s'):format(tostring(nearest.label or 'weapon')))
+      EndTextCommandDisplayHelp(0, false, true, -1)
+      if IsControlJustPressed(0, 0xCEFD9220) then TriggerServerEvent('arachnid_storyteller:weaponPickupCollect', nearest.id) end
+      Wait(0)
+    else
+      Wait(400)
+    end
+  end
 end)
 
 RegisterNetEvent('arachnid_storyteller:actionMessage', function(payload)
@@ -476,6 +625,11 @@ RegisterNUICallback('sessionEncounterAction', function(data, cb)
   cb({ ok = true })
 end)
 
+RegisterNUICallback('rtsSandboxStart', function(_, cb)
+  if opened then TriggerServerEvent('arachnid_storyteller:rtsSandboxStart') end
+  cb({ ok = true })
+end)
+
 RegisterNUICallback('requestRtsSnapshot', function(_, cb)
   if opened then TriggerServerEvent('arachnid_storyteller:requestRtsSnapshot') end
   cb({ ok = true })
@@ -508,6 +662,8 @@ end)
 
 AddEventHandler('onResourceStop', function(resource)
   if resource == GetCurrentResourceName() then
+    reopenAfterPossession = false
+    endRtsPossession(false)
     stopCutscene()
     cleanupStoryEffects()
     SetNuiFocus(false, false)

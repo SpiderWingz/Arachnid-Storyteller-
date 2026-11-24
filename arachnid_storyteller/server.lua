@@ -1,14 +1,17 @@
 local databaseReady = false
 local activeSession = nil
+local activeRtsSandbox = nil
 local statuses = { draft = true, published = true, archived = true }
 local objectiveStatuses = { active = true, completed = true, failed = true }
 local areaShapes = { sphere = true, box = true }
 local frozenByArachnid = {}
 local trackedEncounterEntities = {}
+local nextPickupId = 0
 local cleanupSessionEncounters
 local stopSessionNpcOrders
 local cleanupSessionWorld
 local cleanupSessionEffects
+local endRtsSandbox
 
 MySQL.ready(function()
   local ok, err = pcall(function()
@@ -258,6 +261,21 @@ local function onlinePlayers()
   return players
 end
 
+local function rtsContextActive(context)
+  return context ~= nil and (activeSession == context or activeRtsSandbox == context)
+end
+
+local function rtsPlayerCanBeTargeted(context, playerId)
+  if not playerId or not GetPlayerName(playerId) then return false end
+  if context and context.standalone == true then return true end
+  if not context or not context.audience then return false end
+  if context.audience.mode == 'all' then return true end
+  for _, participantId in ipairs(context.audience.participants or {}) do
+    if tonumber(participantId) == tonumber(playerId) then return true end
+  end
+  return false
+end
+
 local function areaRecord(id)
   local rows = MySQL.query.await([[SELECT id,label,shape,x,y,z,radius,width,depth,height
     FROM arachnid_storyteller_areas WHERE id=? LIMIT 1]], { id })
@@ -432,7 +450,10 @@ local function allowedEncounterWeapon(name)
   if type(entry) ~= 'table' then return nil end
   local ammo = boundedNumber(entry.ammo or 60, 1, Config.Encounters.maxWeaponAmmo or 1000)
   if ammo == nil or ammo % 1 ~= 0 then return nil end
-  return { name = name, label = cleanText(entry.label or name, 100, true) or name, ammo = ammo }
+  return {
+    name = name, label = cleanText(entry.label or name, 100, true) or name, ammo = ammo,
+    pickupModel = type(entry.pickupModel) == 'string' and entry.pickupModel or nil
+  }
 end
 
 local function encounterLoadout(modelEntry)
@@ -896,7 +917,8 @@ local function sessionPayload(mode, session)
     objective = current.objective,
     encounters = {
       npcs = current.entities and #(current.entities.npcs or {}) or 0,
-      props = current.entities and #(current.entities.props or {}) or 0
+      props = current.entities and #(current.entities.props or {}) or 0,
+      pickups = current.entities and #(current.entities.pickups or {}) or 0
     },
     audience = {
       mode = current.audience and current.audience.mode or 'all',
@@ -1096,7 +1118,10 @@ local function sessionEncounterList(session, kind)
   session.entities = session.entities or { npcs = {}, props = {} }
   session.entities.npcs = session.entities.npcs or {}
   session.entities.props = session.entities.props or {}
-  return kind == 'npc' and session.entities.npcs or session.entities.props
+  session.entities.pickups = session.entities.pickups or {}
+  if kind == 'npc' then return session.entities.npcs end
+  if kind == 'pickup' then return session.entities.pickups end
+  return session.entities.props
 end
 
 local function encounterMarker(session, markerId, kind)
@@ -1136,6 +1161,10 @@ end
 stopSessionNpcOrders = function(session)
   if not session or not session.entities or type(session.entities.npcs) ~= 'table' then return end
   for _, npc in ipairs(session.entities.npcs) do
+    if npc.possessedBy then
+      TriggerClientEvent('arachnid_storyteller:rtsPossessionStop', npc.possessedBy, { reason = 'The encounter ended.' })
+      npc.possessedBy = nil
+    end
     if npc.order then stopNpcOrder(npc, false) end
   end
 end
@@ -1184,7 +1213,7 @@ local function startNpcOrder(session, npc, route, settings)
 
   CreateThread(function()
     local routeIndex = 1
-    while activeSession == session and npc.orderToken == token and encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) do
+    while rtsContextActive(session) and npc.orderToken == token and encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) do
       local marker = copiedRoute[routeIndex]
       if not marker then break end
       npc.order.status, npc.order.routeIndex, npc.order.markerId = 'moving', routeIndex, marker.id
@@ -1198,8 +1227,21 @@ local function startNpcOrder(session, npc, route, settings)
         return
       end
       local arrived, deadline = false, GetGameTimer() + math.floor((tonumber(Config.Encounters.patrolPathTimeoutSeconds) or 180) * 1000)
-      while activeSession == session and npc.orderToken == token and GetGameTimer() < deadline do
+      while rtsContextActive(session) and npc.orderToken == token and GetGameTimer() < deadline do
         if not encounterEntityExists(npc.entity) or encounterEntityDead(npc.entity) then return end
+        if settings.attackMoveTargetId then
+          local targetPosition = currentPosition(settings.attackMoveTargetId)
+          local okNpcPosition, npcPosition = pcall(GetEntityCoords, npc.entity)
+          local engagementRange = boundedNumber(Config.Rts.attackMoveRange or 30, 1, 250) or 30
+          if okNpcPosition and targetPosition then
+            local dx, dy, dz = npcPosition.x - targetPosition.x, npcPosition.y - targetPosition.y, npcPosition.z - targetPosition.z
+            if math.sqrt(dx * dx + dy * dy + dz * dz) <= engagementRange then
+              npc.stance = 'fire_at_will'
+              taskNpcCombat(npc, settings.attackMoveTargetId, false)
+              return
+            end
+          end
+        end
         local okPosition, position = pcall(GetEntityCoords, npc.entity)
         if okPosition and position then
           local dx, dy, dz = position.x - tonumber(marker.x), position.y - tonumber(marker.y), position.z - tonumber(marker.z)
@@ -1210,7 +1252,7 @@ local function startNpcOrder(session, npc, route, settings)
         end
         Wait(500)
       end
-      if activeSession ~= session or npc.orderToken ~= token then return end
+      if not rtsContextActive(session) or npc.orderToken ~= token then return end
       if not arrived then
         npc.order.status = 'stuck'
         local clearTasks = type(ClearPedTasks) == 'function' and ClearPedTasks or ClearPedTasksImmediately
@@ -1223,8 +1265,8 @@ local function startNpcOrder(session, npc, route, settings)
       end
       npc.order.status = 'waiting'
       local dwellUntil = GetGameTimer() + math.floor(waitSeconds * 1000)
-      while activeSession == session and npc.orderToken == token and GetGameTimer() < dwellUntil do Wait(250) end
-      if activeSession ~= session or npc.orderToken ~= token then return end
+      while rtsContextActive(session) and npc.orderToken == token and GetGameTimer() < dwellUntil do Wait(250) end
+      if not rtsContextActive(session) or npc.orderToken ~= token then return end
       routeIndex = routeIndex % #copiedRoute + 1
     end
   end)
@@ -1252,7 +1294,34 @@ local function npcOrderWithinLimit(npc, route)
   return true
 end
 
+local function syncWeaponPickups(target)
+  local payload = {}
+  local contexts = {}
+  if activeSession then contexts[#contexts + 1] = activeSession end
+  if activeRtsSandbox then contexts[#contexts + 1] = activeRtsSandbox end
+  for _, context in ipairs(contexts) do
+    if context and context.entities then
+      for _, pickup in ipairs(context.entities.pickups or {}) do
+        payload[#payload + 1] = {
+          id = pickup.id, label = pickup.label, x = pickup.x, y = pickup.y, z = pickup.z
+        }
+      end
+    end
+  end
+  TriggerClientEvent('arachnid_storyteller:weaponPickups', target or -1, payload)
+end
+
+local function releaseEncounterPossession(record, reason)
+  if not record or not record.possessedBy then return end
+  local owner = tonumber(record.possessedBy)
+  record.possessedBy = nil
+  if owner and GetPlayerName(owner) then
+    TriggerClientEvent('arachnid_storyteller:rtsPossessionStop', owner, { reason = reason or 'NPC control released.' })
+  end
+end
+
 local function deleteEncounterRecord(record)
+  if record and record.kind == 'npc' then releaseEncounterPossession(record, 'The controlled NPC was removed.') end
   if not record or not encounterEntityExists(record.entity) then
     if record and record.entity then trackedEncounterEntities[tostring(record.entity)] = nil end
     return
@@ -1263,13 +1332,20 @@ end
 
 cleanupSessionEncounters = function(session, force)
   if not session or not session.entities then return end
-  if not force and Config.Encounters.cleanupOnEnd ~= true then return end
-  for _, kind in ipairs({ 'npcs', 'props' }) do
+  if not force and Config.Encounters.cleanupOnEnd ~= true then
+    local pickups = session.entities.pickups or {}
+    for index = #pickups, 1, -1 do deleteEncounterRecord(pickups[index]); table.remove(pickups, index) end
+    syncWeaponPickups()
+    return
+  end
+  for _, kind in ipairs({ 'npcs', 'props', 'pickups' }) do
+    session.entities[kind] = session.entities[kind] or {}
     for index = #session.entities[kind], 1, -1 do
       deleteEncounterRecord(session.entities[kind][index])
       table.remove(session.entities[kind], index)
     end
   end
+  syncWeaponPickups()
 end
 
 local function cleanupAllEncounterEntities()
@@ -1302,7 +1378,7 @@ local function createEncounterNpc(session, model, marker, health, offsetIndex)
   if type(SetEntityHealth) == 'function' then pcall(SetEntityHealth, ped, health) end
   session.nextNpcId = (session.nextNpcId or 0) + 1
   local record = {
-    id = 'npc-' .. tostring(session.nextNpcId), entity = ped, model = model,
+    id = 'npc-' .. tostring(session.nextNpcId), entity = ped, model = model, kind = 'npc',
     groupId = session.runtimeId .. ':npc:' .. tostring(session.nextNpcId),
     stance = Config.Encounters.defaultStance or 'fire_at_will', weaponStates = {}
   }
@@ -1333,6 +1409,35 @@ local function createEncounterProp(session, model, marker)
   local record = { entity = entity, model = model }
   props[#props + 1] = record
   trackedEncounterEntities[tostring(entity)] = entity
+  return record
+end
+
+local function createWeaponPickup(session, name, marker)
+  if Config.Encounters.allowWeaponPickups ~= true then return nil, 'World weapon pickups are disabled by the server owner.' end
+  if type(CreateObjectNoOffset) ~= 'function' then return nil, 'Server object creation is unavailable.' end
+  local weapon = allowedEncounterWeapon(name)
+  if not weapon or not weapon.pickupModel or not allowedEncounterModel('prop', weapon.pickupModel) then
+    return nil, 'This weapon needs an allowlisted pickup model in server config.'
+  end
+  local pickups = sessionEncounterList(session, 'pickup')
+  local maximum = boundedNumber(Config.Encounters.maxWeaponPickups or 32, 1, 256) or 32
+  if #pickups >= maximum then return nil, 'The active encounter reached its configured weapon pickup limit.' end
+  local hash = GetHashKey(weapon.pickupModel)
+  local ok, entity = pcall(CreateObjectNoOffset, hash, tonumber(marker.x), tonumber(marker.y), tonumber(marker.z), true, true, false)
+  if not ok or not entity or entity == 0 then return nil, 'RedM could not create the configured pickup object.' end
+  if type(SetEntityHeading) == 'function' then pcall(SetEntityHeading, entity, tonumber(marker.heading) or 0) end
+  if type(FreezeEntityPosition) == 'function' then pcall(FreezeEntityPosition, entity, true) end
+  if type(SetEntityAsMissionEntity) == 'function' then pcall(SetEntityAsMissionEntity, entity, true, true) end
+  if type(SetEntityOrphanMode) == 'function' then pcall(SetEntityOrphanMode, entity, 2) end
+  nextPickupId = nextPickupId + 1
+  local record = {
+    id = tostring(session.runtimeId) .. ':pickup:' .. tostring(nextPickupId), entity = entity,
+    kind = 'weapon_pickup', weapon = weapon.name, ammo = weapon.ammo, label = cleanText(weapon.label, 100, true) or weapon.name,
+    x = tonumber(marker.x), y = tonumber(marker.y), z = tonumber(marker.z)
+  }
+  pickups[#pickups + 1] = record
+  trackedEncounterEntities[tostring(entity)] = entity
+  syncWeaponPickups()
   return record
 end
 
@@ -1405,7 +1510,93 @@ end
 
 local rtsStances = { fire_at_will = true, return_fire = true, hold_fire = true }
 
-local function applyRtsCommand(session, action, data)
+local function distance3(left, right)
+  if type(left) ~= 'table' or type(right) ~= 'table' then return nil end
+  local lx, ly, lz = tonumber(left.x), tonumber(left.y), tonumber(left.z)
+  local rx, ry, rz = tonumber(right.x), tonumber(right.y), tonumber(right.z)
+  if not lx or not ly or not lz or not rx or not ry or not rz then return nil end
+  local dx, dy, dz = lx - rx, ly - ry, lz - rz
+  return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function rtsSpawnPosition(context, rawPosition, markerId, markerKind, src)
+  if markerId and not context.standalone then
+    local marker = encounterMarker(context, markerId, markerKind)
+    if marker then return marker end
+    return nil, 'The selected spawn marker is not available in this story.'
+  end
+  local actorPosition = currentPosition(src)
+  if not actorPosition then return nil, 'Your server-verified position is unavailable.' end
+  local position
+  if type(rawPosition) == 'table' then
+    position = {
+      x = boundedNumber(rawPosition.x, -100000, 100000),
+      y = boundedNumber(rawPosition.y, -100000, 100000),
+      z = boundedNumber(rawPosition.z, -100000, 100000)
+    }
+  else
+    position = actorPosition
+  end
+  if not position.x or not position.y or not position.z then return nil, 'The spawn position is invalid.' end
+  local maximum = boundedNumber(Config.Rts.maxSpawnDistance or 250, 1, 10000) or 250
+  local distance = distance3(actorPosition, position)
+  if not distance or distance > maximum then
+    return nil, ('Spawn positions must be within %s meters of your verified position.'):format(tostring(maximum))
+  end
+  local playerPed = GetPlayerPed(src)
+  local heading = playerPed and playerPed ~= 0 and type(GetEntityHeading) == 'function' and GetEntityHeading(playerPed) or 0
+  position.heading = tonumber(heading) or 0
+  return position
+end
+
+local function applyRtsDeployment(context, data, src)
+  local kind = data.deployKind
+  local markerKind = 'npc'
+  if kind == 'prop' or kind == 'weapon' then markerKind = 'prop' end
+  local marker, positionError = rtsSpawnPosition(context, data.position, data.markerId, markerKind, src)
+  if not marker then return false, positionError end
+  if kind == 'npc' then
+    local entry = allowedEncounterModel('ped', data.model)
+    if not entry then return false, 'Choose an NPC from the server allowlist.' end
+    local health = boundedNumber(data.health or 150, 1, maxPedHealth(entry))
+    local count = boundedNumber(data.count or 1, 1, Config.Encounters.maxGroupCount)
+    if not health or health % 1 ~= 0 or not count or count % 1 ~= 0 then return false, 'NPC health or group size is outside configured limits.' end
+    local npcs = sessionEncounterList(context, 'npc')
+    if #npcs + count > Config.Encounters.maxNpcsPerSession then return false, 'The active encounter reached its configured NPC limit.' end
+    local created = {}
+    local groupName = data.groupName and cleanText(data.groupName, 32, false) or nil
+    if data.groupName and groupName == nil then return false, 'Unit group names must be 32 characters or fewer.' end
+    for index = 1, count do
+      local npc, reason = createEncounterNpc(context, data.model, marker, health, #npcs + index)
+      if not npc then
+        for _, record in ipairs(created) do deleteEncounterRecord(record); table.remove(npcs, #npcs) end
+        return false, reason
+      end
+      if groupName and groupName ~= '' then npc.groupName = groupName end
+      created[#created + 1] = npc
+    end
+    return true
+  elseif kind == 'prop' then
+    if not allowedEncounterModel('prop', data.model) then return false, 'Choose a prop from the server allowlist.' end
+    local record, reason = createEncounterProp(context, data.model, marker)
+    return record ~= nil, reason
+  elseif kind == 'weapon' then
+    if not Config.Encounters.allowWeaponPickups or not IsPlayerAceAllowed(src, Config.Ace.playerActions) then
+      return false, 'Weapon pickups require the server toggle and playeractions ACE permission.'
+    end
+    local record, reason = createWeaponPickup(context, data.weapon, marker)
+    return record ~= nil, reason
+  end
+  return false, 'Choose an NPC, prop, or weapon pickup deployment.'
+end
+
+local function applyRtsCommand(session, action, data, src)
+  data = type(data) == 'table' and data or {}
+  if action == 'rts_spawn' then return applyRtsDeployment(session, data, src) end
+  if action == 'rts_sandbox_stop' then
+    if not session.standalone or tonumber(session.startedBySource) ~= tonumber(src) then return false, 'Only the sandbox owner can stop this RTS sandbox.' end
+    return endRtsSandbox(src, 'Stopped by the storyteller.')
+  end
   local selected, selectionError = selectedEncounterNpcs(session, data.npcIds)
   if not selected then return false, selectionError end
   if action == 'rts_move' then
@@ -1435,6 +1626,53 @@ local function applyRtsCommand(session, action, data)
     end
     for _, npc in ipairs(selected) do
       local ok, reason = startNpcOrder(session, npc, { marker }, { loop = false, speed = speed, waitSeconds = 0 })
+      if not ok then return false, reason end
+    end
+  elseif action == 'rts_attack_move' then
+    local targetId = positiveInteger(data.targetPlayerId)
+    if not rtsPlayerCanBeTargeted(session, targetId) then return false, 'Attack-move must target an eligible connected player.' end
+    local rawPosition = type(data.position) == 'table' and data.position or {}
+    local x, y, z = boundedNumber(rawPosition.x, -100000, 100000), boundedNumber(rawPosition.y, -100000, 100000), boundedNumber(rawPosition.z, -100000, 100000)
+    local speed = boundedNumber(data.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+    if not x or not y or not z or not speed then return false, 'Attack-move destination or pace is invalid.' end
+    local marker = { x = x, y = y, z = z, heading = 0 }
+    for _, npc in ipairs(selected) do
+      local withinLimit, distanceError = npcOrderWithinLimit(npc, { marker })
+      if not withinLimit then return false, distanceError end
+    end
+    for _, npc in ipairs(selected) do
+      local ok, reason = startNpcOrder(session, npc, { marker }, { loop = false, speed = speed, waitSeconds = 0, attackMoveTargetId = targetId })
+      if not ok then return false, reason end
+    end
+  elseif action == 'rts_formation' then
+    local formation = data.formation
+    if formation ~= 'line' and formation ~= 'column' and formation ~= 'wedge' then return false, 'Choose line, column, or wedge formation.' end
+    local raw = type(data.position) == 'table' and data.position or {}
+    local x, y, z = boundedNumber(raw.x, -100000, 100000), boundedNumber(raw.y, -100000, 100000), boundedNumber(raw.z, -100000, 100000)
+    local spacing = boundedNumber(data.spacing or 4, 2, 20)
+    local heading = boundedNumber(data.heading or 0, -360, 360)
+    local speed = boundedNumber(data.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+    if not x or not y or not z or not spacing or not heading or not speed then return false, 'Formation destination, spacing, or pace is invalid.' end
+    local theta = math.rad(heading)
+    local destinations = {}
+    for index, npc in ipairs(selected) do
+      local dx, dy = 0, 0
+      if formation == 'line' then
+        dx = (index - (#selected + 1) / 2) * spacing
+      elseif formation == 'column' then
+        dy = -(index - 1) * spacing
+      elseif index > 1 then
+        local row = math.ceil((index - 1) / 2)
+        dx = ((index % 2 == 0) and -1 or 1) * row * spacing
+        dy = -row * spacing
+      end
+      local marker = { x = x + dx * math.cos(theta) - dy * math.sin(theta), y = y + dx * math.sin(theta) + dy * math.cos(theta), z = z, heading = heading }
+      local withinLimit, distanceError = npcOrderWithinLimit(npc, { marker })
+      if not withinLimit then return false, distanceError end
+      destinations[#destinations + 1] = marker
+    end
+    for index, npc in ipairs(selected) do
+      local ok, reason = startNpcOrder(session, npc, { destinations[index] }, { loop = false, speed = speed, waitSeconds = 0 })
       if not ok then return false, reason end
     end
   elseif action == 'rts_patrol' then
@@ -1476,13 +1714,59 @@ local function applyRtsCommand(session, action, data)
     end
   elseif action == 'rts_target' then
     local targetId = positiveInteger(data.targetPlayerId)
-    if not targetId or not GetPlayerName(targetId) or not isAudienceMember(session, targetId) then
-      return false, 'Attack orders can target only connected members of the live session audience.'
+    if not rtsPlayerCanBeTargeted(session, targetId) then
+      return false, 'Attack orders can target only connected members of this story audience, or any player in standalone RTS.'
     end
     for _, npc in ipairs(selected) do
       npc.stance = 'fire_at_will'
       local ok, reason = taskNpcCombat(npc, targetId, false)
       if not ok then return false, reason end
+    end
+  elseif action == 'rts_group_assign' then
+    local groupName = cleanText(data.groupName or '', 32, false)
+    if groupName == nil then return false, 'Unit group names must be 32 characters or fewer.' end
+    if groupName ~= '' then
+      session.groups = session.groups or {}
+      session.groups[groupName] = true
+    end
+    for _, npc in ipairs(selected) do npc.groupName = groupName ~= '' and groupName or nil end
+  elseif action == 'rts_possess' then
+    if Config.Rts.allowPossession ~= true then return false, 'Direct NPC possession is disabled by the server owner.' end
+    if #selected ~= 1 then return false, 'Select exactly one NPC to possess.' end
+    local npc = selected[1]
+    if npc.possessedBy then return false, 'That NPC is already being possessed.' end
+    local contexts = {}
+    if activeSession then contexts[#contexts + 1] = activeSession end
+    if activeRtsSandbox then contexts[#contexts + 1] = activeRtsSandbox end
+    for _, context in ipairs(contexts) do
+      for _, other in ipairs(sessionEncounterList(context, 'npc')) do
+        if other.possessedBy then return false, 'Another NPC is already being possessed.' end
+      end
+    end
+    local playerPosition = currentPosition(src)
+    local okPosition, npcPosition = pcall(GetEntityCoords, npc.entity)
+    local maxDistance = boundedNumber(Config.Rts.possessionMaxDistance or 25, 1, 250) or 25
+    if not playerPosition or not okPosition or not npcPosition or (distance3(playerPosition, npcPosition) or math.huge) > maxDistance then
+      return false, ('Move within %s meters of the NPC before possessing it.'):format(tostring(maxDistance))
+    end
+    if type(NetworkGetNetworkIdFromEntity) ~= 'function' then return false, 'RedM did not provide a network ID for the selected NPC.' end
+    local okNet, netId = pcall(NetworkGetNetworkIdFromEntity, npc.entity)
+    if not okNet or not positiveInteger(netId) then return false, 'The selected NPC is not networked for direct control.' end
+    if type(SetNetworkIdExistsOnAllMachines) == 'function' then pcall(SetNetworkIdExistsOnAllMachines, netId, true) end
+    local targetId = data.targetPlayerId and positiveInteger(data.targetPlayerId) or nil
+    if targetId and not rtsPlayerCanBeTargeted(session, targetId) then return false, 'Choose a connected eligible player as the possession target.' end
+    stopNpcOrder(npc, false)
+    npc.possessedBy, npc.targetId, npc.possessionAttackAt = src, targetId, 0
+    TriggerClientEvent('arachnid_storyteller:rtsPossessionStart', src, {
+      npcId = npc.id, networkId = netId, targetPlayerId = targetId,
+      runtimeId = session.runtimeId, moveSpeed = boundedNumber(Config.Rts.possessionMoveSpeed or 1.5, 0.2, 5) or 1.5
+    })
+  elseif action == 'rts_possession_release' then
+    for _, npc in ipairs(selected) do
+      if tonumber(npc.possessedBy) == tonumber(src) then
+        releaseEncounterPossession(npc, 'NPC control released.')
+        stopNpcOrder(npc, true)
+      end
     end
   elseif action == 'rts_weapon' then
     local weapon = allowedEncounterWeapon(data.weapon)
@@ -1515,7 +1799,8 @@ local function applyRtsCommand(session, action, data)
 end
 
 local function rtsSnapshotPayload(session)
-  local units, waypoints, players = {}, {}, {}
+  local units, waypoints, players, pickups = {}, {}, {}, {}
+  local groups = {}
   for _, npc in ipairs(sessionEncounterList(session, 'npc')) do
     if encounterEntityExists(npc.entity) then
       local ok, position = false, nil
@@ -1533,7 +1818,8 @@ local function rtsSnapshotPayload(session)
         units[#units + 1] = {
           id = npc.id, model = npc.model, x = position.x, y = position.y, z = position.z,
           alive = not encounterEntityDead(npc.entity), health = health,
-          stance = npc.stance or 'fire_at_will', order = {
+          stance = npc.stance or 'fire_at_will', groupName = npc.groupName,
+          possessed = npc.possessedBy ~= nil, order = {
           kind = order.kind, status = order.status, markerId = order.markerId, targetId = order.targetId,
           targetCoords = order.targetCoords,
             routeMarkerIds = order.route and (function()
@@ -1545,6 +1831,7 @@ local function rtsSnapshotPayload(session)
           },
           weapons = weapons
         }
+        if npc.groupName then groups[npc.groupName] = true end
       end
     end
   end
@@ -1554,11 +1841,56 @@ local function rtsSnapshotPayload(session)
     end
   end
   table.sort(waypoints, function(a, b) return tostring(a.label) < tostring(b.label) end)
-  for _, id in ipairs(flowAudiencePlayers(session)) do
+  local playerIds = {}
+  if session.standalone == true then
+    for _, player in ipairs(onlinePlayers()) do playerIds[#playerIds + 1] = player.id end
+  else
+    playerIds = flowAudiencePlayers(session)
+  end
+  for _, id in ipairs(playerIds) do
     local position = currentPosition(id)
     if position then players[#players + 1] = { id = id, name = GetPlayerName(id), x = position.x, y = position.y, z = position.z } end
   end
-  return { storyId = session.storyId, units = units, waypoints = waypoints, players = players }
+  for _, pickup in ipairs(sessionEncounterList(session, 'pickup')) do
+    pickups[#pickups + 1] = { id = pickup.id, label = pickup.label, weapon = pickup.weapon, x = pickup.x, y = pickup.y, z = pickup.z }
+  end
+  return {
+    storyId = session.storyId, sandbox = session.standalone == true, runtimeId = session.runtimeId,
+    units = units, waypoints = waypoints, players = players, pickups = pickups,
+    groups = groups
+  }
+end
+
+endRtsSandbox = function(actor, reason)
+  if not activeRtsSandbox then return false end
+  local sandbox = activeRtsSandbox
+  activeRtsSandbox = nil
+  if stopSessionNpcOrders then stopSessionNpcOrders(sandbox) end
+  cleanupSessionEncounters(sandbox, true)
+  local payload = { sandbox = true, stopped = true, reason = reason or 'RTS sandbox stopped.' }
+  if sandbox.startedBySource and GetPlayerName(sandbox.startedBySource) then
+    TriggerClientEvent('arachnid_storyteller:rtsSnapshot', sandbox.startedBySource, payload)
+  end
+  if actor then logAction(actor, 'Stopped standalone RTS sandbox.') end
+  return true
+end
+
+local function startRtsSandbox(src)
+  if activeSession then return false, 'End the live story session before opening the standalone RTS sandbox.' end
+  if activeRtsSandbox then
+    if tonumber(activeRtsSandbox.startedBySource) ~= tonumber(src) then return false, 'Another storyteller currently owns the RTS sandbox.' end
+    return true
+  end
+  local position = currentPosition(src)
+  if not position then return false, 'Your server-verified position is unavailable.' end
+  activeRtsSandbox = {
+    standalone = true, storyId = nil, storyTitle = 'Standalone RTS sandbox', spawnPoints = {},
+    entities = { npcs = {}, props = {}, pickups = {} }, groups = {},
+    startedAt = os.time(), startedBy = actorName(src), startedBySource = src,
+    anchorPosition = position,
+    runtimeId = ('sandbox:%s:%s:%s'):format(tostring(os.time()), tostring(GetGameTimer()), tostring(src))
+  }
+  return true
 end
 
 local function refreshRtsEngagements(session)
@@ -2322,6 +2654,17 @@ local function snapshot()
     end
     table.sort(encounterModels[kind], function(left, right) return left.label < right.label end)
   end
+  local encounterWeapons = {}
+  for name, entry in pairs(type(encounterConfig.weapons) == 'table' and encounterConfig.weapons or {}) do
+    local weapon = allowedEncounterWeapon(name)
+    if weapon then
+      encounterWeapons[#encounterWeapons + 1] = {
+        name = weapon.name, label = weapon.label, ammo = weapon.ammo,
+        pickupAvailable = encounterConfig.allowWeaponPickups == true and weapon.pickupModel ~= nil and allowedEncounterModel('prop', weapon.pickupModel) ~= nil
+      }
+    end
+  end
+  table.sort(encounterWeapons, function(left, right) return left.label < right.label end)
   local effectsConfig = Config.Effects or {}
   local sounds = {}
   for soundId, sound in pairs(type(effectsConfig.sounds) == 'table' and effectsConfig.sounds or {}) do
@@ -2364,16 +2707,25 @@ local function snapshot()
       enabled = encounterConfig.enabled == true,
       maxNpcsPerSession = encounterConfig.maxNpcsPerSession,
       maxPropsPerSession = encounterConfig.maxPropsPerSession,
+      maxWeaponPickups = encounterConfig.maxWeaponPickups,
+      allowWeaponPickups = encounterConfig.allowWeaponPickups == true,
       maxGroupCount = encounterConfig.maxGroupCount,
       maxNpcHealth = encounterConfig.maxNpcHealth,
       maxPatrolWaitSeconds = encounterConfig.maxPatrolWaitSeconds,
       minPatrolSpeed = encounterConfig.minPatrolSpeed,
       maxPatrolSpeed = encounterConfig.maxPatrolSpeed,
       defaultPatrolSpeed = encounterConfig.defaultPatrolSpeed,
-      models = encounterModels
+      models = encounterModels,
+      weapons = encounterWeapons
     },
     rts = {
       enabled = Config.Rts.enabled == true,
+      allowStandalone = Config.Rts.allowStandalone == true,
+      sandboxActive = activeRtsSandbox ~= nil,
+      sandboxOwnedBy = activeRtsSandbox and activeRtsSandbox.startedBy or nil,
+      allowPossession = Config.Rts.allowPossession == true,
+      maxSpawnDistance = Config.Rts.maxSpawnDistance,
+      attackMoveRange = Config.Rts.attackMoveRange,
       snapshotIntervalMs = Config.Rts.snapshotIntervalMs
     },
     effects = {
@@ -2434,13 +2786,100 @@ end)
 
 RegisterNetEvent('arachnid_storyteller:requestRtsSnapshot', function()
   local src = source
-  if not canManage(src) or not activeSession then return end
+  local context = activeSession or activeRtsSandbox
+  if not canManage(src) or not context then return end
   if Config.Rts.enabled ~= true or Config.Encounters.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.encounters) then return end
-  activeSession.rtsRequestAt = activeSession.rtsRequestAt or {}
+  if context.standalone == true and tonumber(context.startedBySource) ~= tonumber(src) then return end
+  context.rtsRequestAt = context.rtsRequestAt or {}
   local now = GetGameTimer()
-  if now - (activeSession.rtsRequestAt[src] or 0) < 500 then return end
-  activeSession.rtsRequestAt[src] = now
-  TriggerClientEvent('arachnid_storyteller:rtsSnapshot', src, rtsSnapshotPayload(activeSession))
+  if now - (context.rtsRequestAt[src] or 0) < 500 then return end
+  context.rtsRequestAt[src] = now
+  TriggerClientEvent('arachnid_storyteller:rtsSnapshot', src, rtsSnapshotPayload(context))
+end)
+
+RegisterNetEvent('arachnid_storyteller:rtsSandboxStart', function()
+  local src = source
+  if not canManage(src) then return end
+  if Config.Rts.enabled ~= true or Config.Encounters.enabled ~= true or Config.Rts.allowStandalone ~= true then
+    return feedback(src, 'Standalone RTS is disabled by the server owner.')
+  end
+  if not IsPlayerAceAllowed(src, Config.Ace.encounters) then return feedback(src, 'You need the encounters ACE permission for RTS sandbox control.') end
+  local ok, reason = startRtsSandbox(src)
+  if not ok then return feedback(src, reason) end
+  logAction(src, 'Started standalone RTS sandbox.')
+  TriggerClientEvent('arachnid_storyteller:rtsSnapshot', src, rtsSnapshotPayload(activeRtsSandbox))
+  feedback(src, 'Standalone RTS sandbox started. Tracked NPCs, props, and pickups are cleaned up when you stop it or disconnect.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:requestWeaponPickups', function()
+  local src = source
+  syncWeaponPickups(src)
+end)
+
+RegisterNetEvent('arachnid_storyteller:weaponPickupCollect', function(rawId)
+  local src = source
+  if type(rawId) ~= 'string' or #rawId > 160 then return end
+  local contexts = {}
+  if activeSession then contexts[#contexts + 1] = activeSession end
+  if activeRtsSandbox then contexts[#contexts + 1] = activeRtsSandbox end
+  local playerPosition = currentPosition(src)
+  if not playerPosition then return end
+  for _, context in ipairs(contexts) do
+    local pickups = sessionEncounterList(context, 'pickup')
+    for index = #pickups, 1, -1 do
+      local pickup = pickups[index]
+      if pickup.id == rawId and not pickup.claimed then
+        local distance = distance3(playerPosition, pickup)
+        if not distance or distance > 2.5 then return end
+        local weapon = allowedEncounterWeapon(pickup.weapon)
+        if not weapon or not Config.Encounters.allowWeaponPickups then return end
+        pickup.claimed = true
+        TriggerClientEvent('arachnid_storyteller:weaponPickupGrant', src, { weapon = weapon.name, ammo = pickup.ammo })
+        deleteEncounterRecord(pickup)
+        table.remove(pickups, index)
+        syncWeaponPickups()
+        return
+      end
+    end
+  end
+end)
+
+RegisterNetEvent('arachnid_storyteller:rtsPossessionRelease', function()
+  local src = source
+  local contexts = {}
+  if activeSession then contexts[#contexts + 1] = activeSession end
+  if activeRtsSandbox then contexts[#contexts + 1] = activeRtsSandbox end
+  for _, context in ipairs(contexts) do
+    for _, npc in ipairs(sessionEncounterList(context, 'npc')) do
+      if tonumber(npc.possessedBy) == tonumber(src) then
+        releaseEncounterPossession(npc, 'NPC control released.')
+        stopNpcOrder(npc, true)
+        return
+      end
+    end
+  end
+end)
+
+RegisterNetEvent('arachnid_storyteller:rtsPossessionAttack', function(rawState)
+  local src = source
+  local context = activeSession or activeRtsSandbox
+  if not context or type(rawState) ~= 'boolean' then return end
+  for _, npc in ipairs(sessionEncounterList(context, 'npc')) do
+    if tonumber(npc.possessedBy) == tonumber(src) then
+      if rawState then
+        local now = GetGameTimer()
+        if now - (npc.possessionAttackAt or 0) < 350 then return end
+        npc.possessionAttackAt = now
+        if npc.targetId and rtsPlayerCanBeTargeted(context, npc.targetId) then
+          npc.stance = 'fire_at_will'
+          taskNpcCombat(npc, npc.targetId, false)
+        end
+      elseif npc.order and npc.order.kind == 'attack' then
+        stopNpcOrder(npc, true)
+      end
+      return
+    end
+  end
 end)
 
 RegisterNetEvent('arachnid_storyteller:cameraPointCapture', function(rawSceneId, rawHeading, rawDistance)
@@ -2764,7 +3203,7 @@ RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
   if not canManage(src) or not databaseReady then return end
   local storyId = positiveInteger(type(raw) == 'table' and raw.storyId or raw)
   if not storyId then return feedback(src, 'Invalid story identifier.') end
-  if activeSession then return feedback(src, 'A live session is already running. End it before starting another.') end
+  if activeSession or activeRtsSandbox then return feedback(src, 'End the current live session or standalone RTS sandbox before starting a story.') end
   local audienceOk, audience, audienceError = pcall(validatedAudience,
     type(raw) == 'table' and raw.audienceMode or 'all',
     type(raw) == 'table' and raw.participantIds or nil,
@@ -2868,21 +3307,38 @@ end)
 
 RegisterNetEvent('arachnid_storyteller:sessionEncounterAction', function(raw)
   local src = source
-  if not canManage(src) or not activeSession or type(raw) ~= 'table' then return end
-  if Config.Encounters.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.encounters) then
+  if not canManage(src) or type(raw) ~= 'table' then return end
+  local action = type(raw.action) == 'string' and raw.action or ''
+  local context = activeSession
+  if raw.standalone == true then
+    context = activeRtsSandbox
+    if not context or tonumber(context.startedBySource) ~= tonumber(src) then return end
+  end
+  if not context then return end
+  local stopOwnedSandbox = action == 'rts_sandbox_stop' and context.standalone == true and tonumber(context.startedBySource) == tonumber(src)
+  if not stopOwnedSandbox and (Config.Encounters.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.encounters)) then
     return feedback(src, 'Encounters are disabled or you lack the encounters ACE permission.')
   end
-  local action = type(raw.action) == 'string' and raw.action or ''
-  local rtsActions = { rts_move = true, rts_move_point = true, rts_patrol = true, rts_stop = true, rts_stance = true, rts_target = true, rts_weapon = true }
+  local rtsActions = {
+    rts_move = true, rts_move_point = true, rts_attack_move = true, rts_formation = true,
+    rts_patrol = true, rts_stop = true, rts_stance = true, rts_target = true, rts_weapon = true,
+    rts_group_assign = true, rts_possess = true, rts_possession_release = true,
+    rts_spawn = true, rts_sandbox_stop = true
+  }
   if rtsActions[action] then
-    if Config.Rts.enabled ~= true then return feedback(src, 'The NPC RTS tool is disabled by the server owner.') end
-    local ok, actionOk, reason = pcall(applyRtsCommand, activeSession, action, raw)
+    if action ~= 'rts_sandbox_stop' and Config.Rts.enabled ~= true then return feedback(src, 'The NPC RTS tool is disabled by the server owner.') end
+    if action == 'rts_sandbox_stop' and not context.standalone then return feedback(src, 'There is no standalone RTS sandbox to stop.') end
+    local ok, actionOk, reason = pcall(applyRtsCommand, context, action, raw, src)
     if not ok or not actionOk then return feedback(src, 'RTS command failed: ' .. tostring(ok and reason or actionOk)) end
-    logAction(src, ('Issued NPC RTS order %s for story #%s'):format(action, tostring(activeSession.storyId)))
-    TriggerClientEvent('arachnid_storyteller:rtsSnapshot', src, rtsSnapshotPayload(activeSession))
+    local label = context.standalone and 'standalone RTS sandbox' or ('story #%s'):format(tostring(context.storyId))
+    logAction(src, ('Issued NPC RTS order %s in %s'):format(action, label))
+    if action ~= 'rts_sandbox_stop' and rtsContextActive(context) then
+      TriggerClientEvent('arachnid_storyteller:rtsSnapshot', src, rtsSnapshotPayload(context))
+    end
     feedback(src, 'NPC order issued.')
     return
   end
+  if context.standalone then return feedback(src, 'Standalone RTS accepts only tactical-board deployment and unit orders.') end
   local allowed = {
     spawn_npc = true, spawn_npc_group = true, remove_npc = true, make_npc_hostile = true,
     set_npc_target = true, patrol_route = true, stop_patrol = true, spawn_prop = true, delete_prop = true
@@ -3152,6 +3608,24 @@ end)
 AddEventHandler('playerDropped', function()
   local leaving = tonumber(source)
   if leaving then frozenByArachnid[tostring(leaving)] = nil end
+  local contexts = {}
+  if activeSession then contexts[#contexts + 1] = activeSession end
+  if activeRtsSandbox then contexts[#contexts + 1] = activeRtsSandbox end
+  if leaving then
+    for _, context in ipairs(contexts) do
+      for _, npc in ipairs(sessionEncounterList(context, 'npc')) do
+        if tonumber(npc.possessedBy) == leaving then
+          npc.possessedBy = nil
+          stopNpcOrder(npc, false)
+        elseif tonumber(npc.targetId) == leaving then
+          stopNpcOrder(npc, false)
+        end
+      end
+    end
+    if activeRtsSandbox and tonumber(activeRtsSandbox.startedBySource) == leaving then
+      endRtsSandbox(nil, 'The sandbox owner disconnected.')
+    end
+  end
   if leaving and activeSession then
     for _, npc in ipairs(sessionEncounterList(activeSession, 'npc')) do
       if tonumber(npc.targetId) == leaving then stopNpcOrder(npc, false) end
@@ -3306,7 +3780,9 @@ end)
 AddEventHandler('onResourceStop', function(resource)
   if resource == GetCurrentResourceName() then
     if activeSession then endActiveSession('ended', nil) end
+    if activeRtsSandbox then endRtsSandbox(nil, 'The resource stopped.') end
     cleanupOwnedFreezes(nil)
     cleanupAllEncounterEntities()
+    TriggerClientEvent('arachnid_storyteller:weaponPickups', -1, {})
   end
 end)

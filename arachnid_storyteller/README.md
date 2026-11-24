@@ -16,7 +16,7 @@ Arachnid Storyteller is a standalone RedM gamemaster foundation. Its panel takes
 - Add opt-in flow actions for messages, health, armor, weapons, freeze, teleport, kill, VORP respawn, and active-job changes.
 - Play a scene's existing camera rail locally for preview or to the current live-session audience, manually or from a flow; pause and stop playback.
 - Configure per-scene freeze, HUD, letterbox, loop, fade, and default FOV settings for cutscenes.
-- Run NPC patrol routes and open a separate RTS command view to select spawned units and issue move, patrol, stop, stance, target, and configured weapon orders.
+- Open an RTS sandbox when no story is live; deploy allowlisted NPCs, props, and optional shared weapon pickups, then command tracked NPCs with move, attack-move, formations, patrols, named groups, stances, weapon toggles, or direct possession.
 - Capture named teleport destinations for each story at the storyteller's server-verified position and heading.
 - Spawn allowlisted NPCs, NPC groups, and props at story-specific server-captured markers; set hostility, targets, patrol routes, and death waits.
 - Control only registered world targets with owner-approved operations and explicit restore/persist behavior.
@@ -140,11 +140,33 @@ Config.Rts.autoEngageRange = 75
 
 Use the **NPC**, **Prop**, or **Patrol waypoint** marker type in the story editor. The server captures each marker's position and heading from the storyteller's current in-game character. Markers are stored in `arachnid_storyteller_spawn_points`; live sessions use a start-time snapshot. Manual controls and flow nodes can spawn one NPC or a group, remove Arachnid-spawned NPCs/props, make NPCs hostile, select session participants as targets, author ordered patrol routes from saved waypoints, and wait for one/all tracked NPCs to die. `Config.Encounters.cleanupOnEnd` defaults to true. The resource also deletes tracked entities when it stops. OneSync server entity creation is required. Spawned entities are networked/shared with nearby players, including players outside the session audience.
 
-### Separate NPC RTS command view
+### RTS command view and standalone sandbox
 
-The RTS view is a separate live-session tool, opened from the NPC encounter panel. Enable both `Config.Encounters.enabled` and `Config.Rts.enabled`, then grant the storyteller the `arachnid.storyteller.encounters` ACE. It only commands Arachnid-spawned NPCs tracked by the current session. The board is a schematic top-down view of current NPCs, saved patrol waypoints, and connected session participants; it is not an in-world map texture. Select units on the board or roster, then right-click the board for a direct move order (Shift + right-click uses the fastest configured pace), move to a saved waypoint, compose a looping patrol route, stop/hold, attack a connected session participant, or set a combat stance. Use the wheel or zoom buttons to scale the board, middle-drag to pan, and **Fit units** to recenter. Weapon toggles are available for the server-configured weapons on selected NPCs.
+Enable `Config.Encounters.enabled` and `Config.Rts.enabled`, then grant `arachnid.storyteller.encounters`. The story RTS view is opened from the live encounter panel and can only command Arachnid-spawned NPCs in that story. The separate sandbox is available from the console when no story is live; enable `Config.Rts.allowStandalone = true` to use it. Only its owner can issue orders. The sandbox and a live story session cannot run at the same time. Closing the RTS view leaves the sandbox running; **Stop RTS and remove sandbox entities** removes its tracked NPCs, props, and pickups. They are also removed when the sandbox owner disconnects or the resource stops. Sandbox state is in memory and is not restored after a resource restart.
 
-Fire at Will automatically assigns the nearest connected session participant within `Config.Rts.autoEngageRange` (75 meters by default) while the RTS mode is enabled. This is a server-side distance check, not a line-of-sight check. Return Fire holds until a session participant damages that NPC, and Hold Fire stops its attack order. The `F`, `Z`, and `H` keys switch stances; `Q` attacks the chosen participant; `Space` stops selected units; `Esc` closes the RTS view. Movement pace, patrol dwell, and `Config.Rts.maxOrderDistance` are validated on the server. Set `Config.Rts.autoEngage = false` to require manual target orders. Add NPC weapons to each ped model's `weapons` entry and `Config.Encounters.weapons`; both lists must allow the weapon before it can be toggled. The RTS view is disabled by default. If the session ends, active NPC orders are cleared even when `cleanupOnEnd` is false.
+The board is a schematic top-down view of tracked NPCs, saved story patrol waypoints, pickups, and eligible players; it is not an in-world map texture. Left-click units to select them. Right-click the board to move; Shift + right-click uses the fastest configured pace. Choose Line, Column, or Wedge, then right-click to order that formation. Attack-move sends selected units toward a selected eligible player and engages that player if they come within `Config.Rts.attackMoveRange` (30 meters by default). Set `Config.Rts.autoEngage = false` to disable story-session automatic targeting; standalone NPCs stay passive unless the storyteller explicitly gives them a target or attack-move order. Fire at Will automatically assigns the nearest connected story participant within `Config.Rts.autoEngageRange` (75 meters by default), which is a server-side distance check, not line of sight. Return Fire holds until a participant damages that NPC; Hold Fire stops its attack order.
+
+Name a group from the current selection, then use number keys to select the groups shown in the view. `Ctrl + number` assigns the selected NPCs to `Group 1` through `Group 9`. The `F`, `Z`, and `H` keys switch stances; `Q` attacks the chosen eligible player; `Space` stops selected units; `Esc` closes the RTS view. Movement pace, patrol dwell, formation spacing, spawn distance, and order distance are validated on the server. NPC weapons must appear in both the ped model's `weapons` list and `Config.Encounters.weapons` before they can be applied or toggled.
+
+Direct possession is a separate, opt-in control mode. Set `Config.Rts.allowPossession = true`; a storyteller must be within `Config.Rts.possessionMaxDistance` (25 meters by default) of a tracked NPC. Possession follows that NPC with a camera, maps WASD and mouse movement to it, and uses left click to engage the selected eligible target. **E** or **Esc** releases control; releasing, removing the NPC, ending the session, disconnecting, and stopping the resource restore the storyteller's controls. This changes no player model and cannot possess arbitrary world NPCs.
+
+The deploy panel offers models from the server allowlists. Spawn at the storyteller's current server-verified position, at a saved story marker, or arm a placement and right-click a tactical-board point. Board positions must be within `Config.Rts.maxSpawnDistance` (250 meters by default) of the storyteller's current server-verified position. NPC group size, health, entity totals, and model choices are server checked.
+
+Weapon pickups are disabled by default. To enable them, set `Config.Encounters.allowWeaponPickups = true`, grant storytellers `arachnid.storyteller.playeractions` in addition to the encounters ACE, and add `pickupModel` to each pickup weapon in the server allowlist. The pickup model must also be in `Config.Encounters.propModels`. For example:
+
+```lua
+Config.Encounters.weapons = {
+  WEAPON_REVOLVER_CATTLEMAN = { label = 'Cattleman revolver', ammo = 60, pickupModel = 'w_revolver_cattleman01' }
+}
+Config.Encounters.propModels = {
+  w_revolver_cattleman01 = { label = 'Cattleman pickup' }
+}
+Config.Encounters.allowWeaponPickups = true
+Config.Rts.allowStandalone = true
+Config.Rts.allowPossession = true
+```
+
+The server tracks a networked display prop and accepts a pickup only when a connected player is within 2.5 meters. Anyone nearby can collect it with the context key; the server then grants the configured RDR3 weapon/ammo to that player's ped and removes the pickup. This is a base game weapon grant, not a VORP inventory item integration. Confirm pickup model visibility and weapon behavior on the target RedM/VORP build before enabling it on a live server. `Config.Rts.allowStandalone`, `Config.Rts.allowPossession`, and `Config.Encounters.allowWeaponPickups` default to false.
 
 See [TESTING.md](TESTING.md) for the RedM live-server checklist.
 
@@ -184,4 +206,4 @@ Flow nodes and live controls support Play/Stop Sound, Screen Fade, Announcement,
 
 ## Verification notes
 
-The repository checks cover JavaScript parsing, UI-to-NUI callback wiring, NUI-to-server event wiring, and whitespace validation. This checkout does not include a Lua parser, FXServer/RedM runtime, VORP server, or staging oxmysql database, so Lua parsing and live RedM integration scenarios still need to be run on the server before enabling state-changing features.
+For the RTS sandbox increment, `node --check` passed for `html/flow.js`, and the new NUI callbacks and client/server event names were checked. `git diff --check` passed. This checkout has no Lua parser, FXServer/RedM runtime, VORP server, or staging oxmysql database, so Lua parsing and the live scenarios in [TESTING.md](TESTING.md) still need a staging server before enabling possession or weapon pickups.

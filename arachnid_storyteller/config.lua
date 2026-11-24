@@ -122,8 +122,12 @@ Config.Cutscenes = {
 Config.Encounters = {
   enabled = false,
   cleanupOnEnd = true,
+  -- World weapon pickups are shared with anyone nearby and require both
+  -- encounters and playeractions ACE permissions.
+  allowWeaponPickups = false,
   maxNpcsPerSession = 32,
   maxPropsPerSession = 64,
+  maxWeaponPickups = 32,
   maxGroupCount = 12,
   maxNpcHealth = 1000,
   maxWeaponAmmo = 1000,
@@ -140,10 +144,16 @@ Config.Encounters = {
   propModels = {}
 }
 
--- The tactical command view is a separate live-session tool. It only controls
--- NPCs spawned and tracked by this resource, and requires the encounters ACE.
+-- The tactical view controls only NPCs spawned and tracked by this resource.
+-- Standalone use, direct possession, and weapon pickups all default off.
 Config.Rts = {
   enabled = false,
+  allowStandalone = false,
+  maxSpawnDistance = 250,
+  allowPossession = false,
+  possessionMaxDistance = 25,
+  possessionMoveSpeed = 1.5,
+  attackMoveRange = 30,
   snapshotIntervalMs = 1200,
   maxOrderDistance = 1000,
   autoEngage = true,

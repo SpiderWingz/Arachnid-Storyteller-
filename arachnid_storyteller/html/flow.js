@@ -908,6 +908,19 @@
   let rtsSnapshot = null;
   let rtsView = null;
   let rtsPan = null;
+  let rtsStandalone = false;
+  let rtsPendingDeployment = false;
+  let rtsPendingFormation = null;
+  let rtsDeployKindPicker = null;
+  let rtsDeployModelPicker = null;
+  let rtsDeployMarkerPicker = null;
+  let rtsDeployHealth = null;
+  let rtsDeployCount = null;
+  let rtsDeployGroup = null;
+  let rtsFormationButtons = [];
+  let rtsGroupNameInput = null;
+  let rtsGroupsPanel = null;
+  let getRtsDeploymentPayload = null;
 
   function closeRtsCommandView() {
     if (rtsSnapshotTimer) clearInterval(rtsSnapshotTimer);
@@ -916,8 +929,16 @@
     rtsOverlay = null;
     rtsStoryId = null;
     rtsStory = null;
+    rtsStandalone = false;
+    rtsPendingDeployment = false;
+    rtsPendingFormation = null;
     rtsCanvas = rtsRoster = rtsSelectionSummary = rtsWeaponPanel = null;
     rtsTargetPicker = rtsSpeedControl = rtsDwellControl = rtsWaypointPicker = rtsRouteList = null;
+    rtsDeployKindPicker = rtsDeployModelPicker = rtsDeployMarkerPicker = null;
+    rtsDeployHealth = rtsDeployCount = rtsDeployGroup = null;
+    rtsFormationButtons = [];
+    rtsGroupNameInput = rtsGroupsPanel = null;
+    getRtsDeploymentPayload = null;
     rtsView = rtsPan = null;
     selectedRtsUnits.clear();
     rtsPatrolRoute = [];
@@ -925,16 +946,17 @@
 
   function sendRtsCommand(action, extra = {}) {
     const ids = [...selectedRtsUnits];
-    if (!ids.length) return;
-    storyteller.send('sessionEncounterAction', { action, npcIds: ids, ...extra });
+    if (!ids.length && !['rts_spawn', 'rts_sandbox_stop'].includes(action)) return;
+    storyteller.send('sessionEncounterAction', { action, npcIds: ids, ...(rtsStandalone ? { standalone: true } : {}), ...extra });
   }
 
-  function openRtsCommandView(story) {
-    if (!story?.id) return;
-    if (rtsOverlay && Number(rtsStoryId) === Number(story.id)) return;
+  function openRtsCommandView(story, standalone = false) {
+    if (!standalone && !story?.id) return;
+    if (rtsOverlay && (standalone ? rtsStandalone : Number(rtsStoryId) === Number(story.id))) return;
     closeRtsCommandView();
-    rtsStoryId = Number(story.id);
-    rtsStory = story;
+    rtsStandalone = standalone === true;
+    rtsStoryId = rtsStandalone ? 'sandbox' : Number(story.id);
+    rtsStory = story || { id: null, spawnPoints: [] };
     selectedRtsUnits.clear();
     rtsPatrolRoute = [];
     rtsSnapshot = null;
@@ -945,9 +967,15 @@
     const shell = element('div', undefined, 'rts-shell');
     const header = element('header', undefined, 'rts-header');
     const heading = element('div');
-    heading.append(element('small', 'ARACHNID STORYTELLER · LIVE TACTICAL CONTROL'), element('h2', 'NPC RTS COMMAND VIEW'), element('p', 'Select Arachnid NPC units, then issue orders from the tactical board and command bar.', 'muted'));
+    heading.append(element('small', 'ARACHNID STORYTELLER · ' + (rtsStandalone ? 'STANDALONE RTS SANDBOX' : 'LIVE STORY CONTROL')), element('h2', rtsStandalone ? 'RTS SANDBOX' : 'NPC RTS COMMAND VIEW'), element('p', rtsStandalone ? 'Deploy and command tracked units without starting a story. Nothing spawns until you place it.' : 'Select Arachnid NPC units, then issue orders from the tactical board and command bar.', 'muted'));
     const close = element('button', 'Close RTS view'); close.type = 'button'; close.onclick = closeRtsCommandView;
-    header.append(heading, close);
+    header.append(heading);
+    if (rtsStandalone) {
+      const stopSandbox = element('button', 'Stop RTS and remove sandbox entities', 'danger'); stopSandbox.type = 'button';
+      stopSandbox.onclick = () => sendRtsCommand('rts_sandbox_stop');
+      header.append(stopSandbox);
+    }
+    header.append(close);
     const layout = element('div', undefined, 'rts-layout');
     const boardPanel = element('section', undefined, 'rts-board-panel');
     const boardHeader = element('div', undefined, 'rts-board-heading');
@@ -984,14 +1012,77 @@
     rtsCanvas.addEventListener('pointerup', event => { if (rtsPan?.pointerId === event.pointerId) rtsPan = null; });
     rtsCanvas.addEventListener('pointercancel', () => { rtsPan = null; });
     rtsSelectionSummary = element('p', 'No NPCs selected.', 'muted');
-    boardPanel.append(boardHeader, rtsCanvas, element('p', 'NPCs: red · selected units: gold · patrol waypoints: diamonds · audience players: blue', 'muted'), rtsSelectionSummary);
+    boardPanel.append(boardHeader, rtsCanvas, element('p', 'NPCs: red · selected units: gold · patrol waypoints: diamonds · weapon pickups: green · ' + (rtsStandalone ? 'online players: blue' : 'audience players: blue'), 'muted'), rtsSelectionSummary);
     const rosterPanel = element('aside', undefined, 'rts-roster-panel');
-    rosterPanel.append(element('h3', 'Session units'));
+    rosterPanel.append(element('h3', rtsStandalone ? 'Sandbox units' : 'Session units'));
     rtsRoster = element('div', undefined, 'rts-roster');
     rosterPanel.append(rtsRoster);
     layout.append(boardPanel, rosterPanel);
 
     const commandBar = element('section', undefined, 'rts-command-bar');
+    const deploy = element('div', undefined, 'rts-command-section');
+    deploy.append(element('h3', 'Deploy units and items'));
+    const config = storyteller.getState()?.encounters || {};
+    const spawnPoints = rtsStory.spawnPoints || [];
+    const weaponOptions = (config.weapons || []).filter(weapon => weapon.pickupAvailable === true);
+    const deployTypes = [{ value: 'npc', label: 'NPC' }, { value: 'prop', label: 'Prop' }];
+    if (config.allowWeaponPickups === true && weaponOptions.length) deployTypes.push({ value: 'weapon', label: 'World weapon pickup' });
+    rtsDeployKindPicker = selectControl(deployTypes, 'npc');
+    rtsDeployModelPicker = selectControl([], '');
+    rtsDeployMarkerPicker = selectControl([{ value: '', label: 'Server verified GM position / board point' }], '');
+    rtsDeployHealth = inputControl(150, 'number', 1, Number(config.maxNpcHealth || 1000), '1');
+    rtsDeployCount = inputControl(1, 'number', 1, Number(config.maxGroupCount || 12), '1');
+    rtsDeployGroup = inputControl('', 'text'); rtsDeployGroup.maxLength = 32; rtsDeployGroup.placeholder = 'Optional unit group name';
+    const deployHealthField = field('NPC health', rtsDeployHealth);
+    const deployCountField = field('NPC count', rtsDeployCount);
+    const deployGroupField = field('Named unit group', rtsDeployGroup);
+    let deployAtMarker = null;
+    const updateDeployChoices = () => {
+      const kind = rtsDeployKindPicker.value;
+      const options = kind === 'npc' ? config.models?.ped || [] : kind === 'prop' ? config.models?.prop || [] : weaponOptions;
+      rtsDeployModelPicker.replaceChildren(...options.map(item => { const option = element('option', item.label); option.value = item.name; return option; }));
+      const pointKind = kind === 'npc' ? 'npc' : 'prop';
+      const markers = rtsStandalone ? [] : spawnPoints.filter(point => point.kind === pointKind);
+      rtsDeployMarkerPicker.replaceChildren(
+        ...[{ value: '', label: 'Server verified GM position / board point' }, ...markers.map(point => ({ value: point.id, label: point.label }))]
+          .map(item => { const option = element('option', item.label); option.value = String(item.value); return option; })
+      );
+      deployHealthField.hidden = kind !== 'npc';
+      deployCountField.hidden = kind !== 'npc';
+      deployGroupField.hidden = kind !== 'npc';
+      if (deployAtMarker) deployAtMarker.disabled = rtsStandalone || !markers.length;
+    };
+    rtsDeployKindPicker.onchange = updateDeployChoices;
+    updateDeployChoices();
+    const deploymentPayload = () => {
+      const kind = rtsDeployKindPicker.value;
+      const payload = { deployKind: kind };
+      if (kind === 'weapon') payload.weapon = rtsDeployModelPicker.value;
+      else payload.model = rtsDeployModelPicker.value;
+      if (kind === 'npc') {
+        payload.health = Number(rtsDeployHealth.value);
+        payload.count = Number(rtsDeployCount.value);
+        payload.groupName = rtsDeployGroup.value.trim();
+      }
+      if (rtsDeployMarkerPicker.value) payload.markerId = Number(rtsDeployMarkerPicker.value);
+      return payload;
+    };
+    getRtsDeploymentPayload = deploymentPayload;
+    const deployAtPosition = element('button', 'Spawn at my verified position'); deployAtPosition.type = 'button';
+    deployAtPosition.onclick = () => { const payload = deploymentPayload(); delete payload.markerId; sendRtsCommand('rts_spawn', payload); };
+    const placeOnBoard = element('button', 'Place at next board click'); placeOnBoard.type = 'button';
+    placeOnBoard.onclick = () => { rtsPendingDeployment = true; rtsPendingFormation = null; placeOnBoard.textContent = 'Right-click the board to place'; };
+    deployAtMarker = element('button', 'Spawn at selected saved marker'); deployAtMarker.type = 'button';
+    deployAtMarker.onclick = () => { const payload = deploymentPayload(); if (payload.markerId) sendRtsCommand('rts_spawn', payload); };
+    updateDeployChoices();
+    deploy.append(field('Deploy type', rtsDeployKindPicker), field('Server allowlist', rtsDeployModelPicker), field('Spawn location', rtsDeployMarkerPicker),
+      deployHealthField, deployCountField, deployGroupField, deployAtPosition, placeOnBoard, deployAtMarker);
+    const deployNote = element('p', config.allowWeaponPickups === true
+      ? 'Board placements are checked against your current server verified position. Nearby players can collect configured weapon pickups with the context key.'
+      : 'Board placements are checked against your current server verified position. Weapon pickups are disabled by the server owner.', 'muted');
+    deploy.append(deployNote);
+    commandBar.append(deploy);
+
     const selectionControls = element('div', undefined, 'rts-command-section');
     selectionControls.append(element('h3', 'Selection'));
     const selectAll = element('button', 'Select all living NPCs'); selectAll.type = 'button';
@@ -1020,37 +1111,70 @@
     addRoute.onclick = () => { const id = Number(routePicker.value); if (id && !rtsPatrolRoute.includes(id)) { rtsPatrolRoute.push(id); renderRtsRouteList(); } };
     movement.append(field('Ordered patrol route', routePicker), addRoute, rtsRouteList, patrolButton, stopButton);
 
+    const formation = element('div', undefined, 'rts-command-section');
+    formation.append(element('h3', 'Formations and groups'));
+    const formationHint = element('p', 'Choose a formation, then right-click a destination on the board.', 'muted');
+    rtsFormationButtons = [];
+    for (const name of ['line', 'column', 'wedge']) {
+      const button = element('button', 'Order ' + name); button.type = 'button';
+      button.onclick = () => { rtsPendingFormation = name; rtsPendingDeployment = false; formationHint.textContent = 'Right-click the tactical board to place the ' + name + ' formation.'; };
+      rtsFormationButtons.push(button); formation.append(button);
+    }
+    rtsGroupNameInput = inputControl('', 'text'); rtsGroupNameInput.maxLength = 32; rtsGroupNameInput.placeholder = 'e.g. North gate';
+    const assignGroup = element('button', 'Name selected group'); assignGroup.type = 'button';
+    assignGroup.onclick = () => { if (rtsGroupNameInput.value.trim()) sendRtsCommand('rts_group_assign', { groupName: rtsGroupNameInput.value.trim() }); };
+    rtsGroupsPanel = element('div', undefined, 'rts-groups');
+    formation.append(formationHint, field('Group name', rtsGroupNameInput), assignGroup, rtsGroupsPanel);
+    commandBar.append(formation);
+
     const combat = element('div', undefined, 'rts-command-section');
-    combat.append(element('h3', 'Engagement'));
-    rtsTargetPicker = selectControl([{ value: '', label: 'Choose session participant' }, ...(rtsSnapshot?.players || []).map(player => ({ value: player.id, label: player.name + ' (#' + player.id + ')' }))], '');
+    combat.append(element('h3', 'Engagement and control'));
+    rtsTargetPicker = selectControl([{ value: '', label: 'Choose eligible player' }, ...(rtsSnapshot?.players || []).map(player => ({ value: player.id, label: player.name + ' (#' + player.id + ')' }))], '');
     const targetButton = element('button', 'Attack selected participant'); targetButton.type = 'button';
     targetButton.onclick = () => rtsTargetPicker.value && sendRtsCommand('rts_target', { targetPlayerId: Number(rtsTargetPicker.value) });
+    const attackMoveButton = element('button', 'Attack-move toward selected player'); attackMoveButton.type = 'button';
+    attackMoveButton.onclick = () => {
+      const target = rtsSnapshot?.players?.find(player => Number(player.id) === Number(rtsTargetPicker.value));
+      if (target) sendRtsCommand('rts_attack_move', { targetPlayerId: Number(target.id), position: { x: target.x, y: target.y, z: target.z }, speed: Number(rtsSpeedControl.value) });
+    };
+    const possessButton = element('button', 'Possess selected NPC'); possessButton.type = 'button';
+    possessButton.disabled = storyteller.getState()?.rts?.allowPossession !== true;
+    possessButton.title = possessButton.disabled ? 'Enable Config.Rts.allowPossession to allow direct control.' : '';
+    possessButton.onclick = () => {
+      if (selectedRtsUnits.size !== 1) return;
+      const extra = rtsTargetPicker.value ? { targetPlayerId: Number(rtsTargetPicker.value) } : {};
+      sendRtsCommand('rts_possess', extra);
+    };
     const stances = element('div', undefined, 'rts-stances');
     for (const [stance, label, hotkey] of [['fire_at_will', 'Fire at Will · F', 'F'], ['return_fire', 'Return Fire · Z', 'Z'], ['hold_fire', 'Hold Fire · H', 'H']]) {
       const button = element('button', label); button.type = 'button'; button.dataset.stance = stance;
       button.onclick = () => sendRtsCommand('rts_stance', { stance });
       stances.append(button);
     }
-    combat.append(field('Target', rtsTargetPicker), targetButton, stances, element('h4', 'Configured weapons'), element('div', undefined, 'muted'));
+    combat.append(field('Target', rtsTargetPicker), targetButton, attackMoveButton, possessButton, stances, element('h4', 'Configured weapons'), element('div', undefined, 'muted'));
     rtsWeaponPanel = combat.lastElementChild;
     const weaponInfo = element('p', 'Weapon toggles appear for weapons configured on every selected NPC.', 'muted');
     combat.append(weaponInfo);
     commandBar.append(selectionControls, movement, combat);
-    const help = element('p', 'Hotkeys while this view is open: F fire at will · Z return fire · H hold fire · Q attack chosen participant · Space stop selected units · Esc close.', 'muted');
+    const help = element('p', 'Hotkeys: F fire at will · Z return fire · H hold fire · Q attack chosen player · Space stop selected units · number keys select named groups · Ctrl + number assigns the selection · Esc closes. Possession uses WASD and mouse camera movement; left click attacks the chosen target. E or Esc releases control.', 'muted');
     shell.append(header, layout, commandBar, help);
     rtsOverlay.append(shell);
     document.body.append(rtsOverlay);
     renderRtsRouteList();
     updateRtsDisplay();
-    storyteller.send('requestRtsSnapshot');
+    if (rtsStandalone) storyteller.send('rtsSandboxStart');
+    else storyteller.send('requestRtsSnapshot');
     const interval = Number(storyteller.getState()?.rts?.snapshotIntervalMs) || 1200;
+    const openedAt = Date.now();
     rtsSnapshotTimer = setInterval(() => {
       const state = storyteller.getState();
-      if (!rtsOverlay || !state || state.session?.state !== 'active' || Number(state.session.story?.id) !== Number(rtsStoryId)) {
+      const storyStillLive = state?.session?.state === 'active' && Number(state.session.story?.id) === Number(rtsStoryId);
+      const sandboxStillLive = rtsStandalone && state?.rts?.sandboxActive === true;
+      if (!rtsOverlay || !state || (!rtsStandalone && !storyStillLive) || (rtsStandalone && !sandboxStillLive && Date.now() - openedAt > 5000)) {
         closeRtsCommandView();
         return;
       }
-      storyteller.send('requestRtsSnapshot');
+      if (rtsStandalone ? sandboxStillLive : storyStillLive) storyteller.send('requestRtsSnapshot');
     }, Math.max(700, interval));
   }
 
@@ -1108,7 +1232,6 @@
       }
       return;
     }
-    if (!selectedRtsUnits.size) return;
     const projection = rtsCanvas._rtsProjection;
     if (!projection || !Number.isFinite(projection.scale) || projection.scale <= 0) return;
     const elevatedWorld = projection.world.filter(item => Number.isFinite(Number(item.z)));
@@ -1122,6 +1245,21 @@
       z: Number(nearestWorld?.item?.z)
     };
     if (Number.isFinite(position.x) && Number.isFinite(position.y) && Number.isFinite(position.z)) {
+      if (rtsPendingDeployment && getRtsDeploymentPayload) {
+        const payload = getRtsDeploymentPayload();
+        delete payload.markerId;
+        payload.position = position;
+        sendRtsCommand('rts_spawn', payload);
+        rtsPendingDeployment = false;
+        rtsFormationButtons.forEach(button => button.disabled = false);
+        return;
+      }
+      if (rtsPendingFormation) {
+        sendRtsCommand('rts_formation', { formation: rtsPendingFormation, position, speed: Number(rtsSpeedControl?.value || 1), spacing: 4 });
+        rtsPendingFormation = null;
+        return;
+      }
+      if (!selectedRtsUnits.size) return;
       const fastSpeed = Number(storyteller.getState()?.encounters?.maxPatrolSpeed || rtsSpeedControl?.max || 3);
       sendRtsCommand('rts_move_point', { position, speed: event.shiftKey ? fastSpeed : Number(rtsSpeedControl?.value || 1) });
     }
@@ -1133,8 +1271,8 @@
     const width = rtsCanvas.width, height = rtsCanvas.height;
     ctx.clearRect(0, 0, width, height);
     ctx.fillStyle = '#0c1415'; ctx.fillRect(0, 0, width, height);
-    const units = snapshot?.units || [], waypoints = snapshot?.waypoints || [], players = snapshot?.players || [];
-    const world = [...units, ...waypoints, ...players].filter(item => Number.isFinite(Number(item.x)) && Number.isFinite(Number(item.y)));
+    const units = snapshot?.units || [], waypoints = snapshot?.waypoints || [], players = snapshot?.players || [], pickups = snapshot?.pickups || [];
+    const world = [...units, ...waypoints, ...players, ...pickups].filter(item => Number.isFinite(Number(item.x)) && Number.isFinite(Number(item.y)));
     if (!world.length) {
       ctx.fillStyle = '#d8c5a4'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('No tracked NPCs or patrol waypoints in this session yet.', width / 2, height / 2);
       rtsCanvas._rtsPoints = { units: [], waypoints: [] }; return;
@@ -1177,6 +1315,12 @@
       ctx.fillStyle = '#e2bb72'; ctx.beginPath(); ctx.moveTo(item.px, item.py - 12); ctx.lineTo(item.px + 11, item.py); ctx.lineTo(item.px, item.py + 12); ctx.lineTo(item.px - 11, item.py); ctx.closePath(); ctx.fill();
       ctx.fillStyle = '#f1dfbf'; ctx.font = '15px sans-serif'; ctx.textAlign = 'left'; ctx.fillText(item.waypoint.label, item.px + 14, item.py + 5);
     }
+    for (const pickup of pickups) {
+      const point = project(pickup);
+      ctx.fillStyle = '#70c29a'; ctx.beginPath(); ctx.arc(point.px, point.py, 9, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#d3f4df'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#d3f4df'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left'; ctx.fillText('Pickup · ' + pickup.label, point.px + 12, point.py + 4);
+    }
     for (const player of players) {
       const point = project(player);
       ctx.fillStyle = '#74b8d9'; ctx.beginPath(); ctx.arc(point.px, point.py, 10, 0, Math.PI * 2); ctx.fill();
@@ -1196,13 +1340,15 @@
   function updateRtsDisplay() {
     if (!rtsOverlay) return;
     const state = storyteller.getState() || {};
-    rtsSnapshot = Number(state.rtsSnapshot?.storyId) === Number(rtsStoryId) ? state.rtsSnapshot : null;
+    rtsSnapshot = rtsStandalone
+      ? state.rtsSnapshot?.sandbox === true && state.rtsSnapshot?.stopped !== true ? state.rtsSnapshot : null
+      : Number(state.rtsSnapshot?.storyId) === Number(rtsStoryId) ? state.rtsSnapshot : null;
     const units = rtsSnapshot?.units || [];
     for (const id of [...selectedRtsUnits]) if (!units.some(unit => String(unit.id) === id && unit.alive)) selectedRtsUnits.delete(id);
     drawRtsBoard(rtsSnapshot);
     rtsSelectionSummary.textContent = selectedRtsUnits.size + ' unit(s) selected · ' + units.length + ' tracked in session.';
     rtsRoster.replaceChildren();
-    if (!units.length) rtsRoster.append(element('p', 'Spawn NPCs in the live encounter panel to command them here.', 'muted'));
+    if (!units.length) rtsRoster.append(element('p', rtsStandalone ? 'Use Deploy units and items to add sandbox NPCs.' : 'Spawn NPCs in the live encounter panel to command them here.', 'muted'));
     for (const unit of units) {
       const card = element('button', undefined, 'rts-unit-card' + (selectedRtsUnits.has(String(unit.id)) ? ' selected' : ''));
       card.type = 'button';
@@ -1210,11 +1356,25 @@
       card.onclick = () => { const id = String(unit.id); if (selectedRtsUnits.has(id)) selectedRtsUnits.delete(id); else selectedRtsUnits.add(id); updateRtsDisplay(); };
       rtsRoster.append(card);
     }
-    const participantOptions = [{ value: '', label: 'Choose session participant' }, ...(rtsSnapshot?.players || []).map(player => ({ value: player.id, label: player.name + ' (#' + player.id + ')' }))];
+    const participantOptions = [{ value: '', label: rtsStandalone ? 'Choose online player' : 'Choose session participant' }, ...(rtsSnapshot?.players || []).map(player => ({ value: player.id, label: player.name + ' (#' + player.id + ')' }))];
     const selectedTarget = rtsTargetPicker?.value;
     if (rtsTargetPicker) {
       rtsTargetPicker.replaceChildren(...participantOptions.map(item => { const option = element('option', item.label); option.value = String(item.value); return option; }));
       if ([...rtsTargetPicker.options].some(option => option.value === selectedTarget)) rtsTargetPicker.value = selectedTarget;
+    }
+    if (rtsGroupsPanel) {
+      rtsGroupsPanel.replaceChildren();
+      const groupNames = Object.keys(rtsSnapshot?.groups || {}).sort((a, b) => a.localeCompare(b));
+      if (!groupNames.length) rtsGroupsPanel.append(element('span', 'No named groups yet.', 'muted'));
+      for (const name of groupNames) {
+        const button = element('button', 'Select ' + name); button.type = 'button';
+        button.onclick = () => {
+          selectedRtsUnits.clear();
+          for (const unit of units) if (unit.alive && unit.groupName === name) selectedRtsUnits.add(String(unit.id));
+          updateRtsDisplay();
+        };
+        rtsGroupsPanel.append(button);
+      }
     }
     rtsWeaponPanel.replaceChildren();
     const selected = units.filter(unit => selectedRtsUnits.has(String(unit.id)));
@@ -1235,7 +1395,22 @@
     if (!rtsOverlay) return;
     const key = event.key.toLowerCase();
     if (key === 'escape') { event.preventDefault(); event.stopImmediatePropagation(); closeRtsCommandView(); return; }
-    if (['f', 'z', 'h', 'q', ' '].includes(key) && (event.target === document.body || event.target === rtsOverlay || !['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName))) {
+    const editing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName);
+    if (!editing && /^[1-9]$/.test(key)) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (event.ctrlKey) {
+        if (selectedRtsUnits.size) sendRtsCommand('rts_group_assign', { groupName: 'Group ' + key });
+      } else {
+        const groupName = Object.keys(rtsSnapshot?.groups || {}).sort((a, b) => a.localeCompare(b))[Number(key) - 1];
+        if (groupName) {
+          selectedRtsUnits.clear();
+          for (const unit of rtsSnapshot?.units || []) if (unit.alive && unit.groupName === groupName) selectedRtsUnits.add(String(unit.id));
+          updateRtsDisplay();
+        }
+      }
+      return;
+    }
+    if (['f', 'z', 'h', 'q', ' '].includes(key) && !editing) {
       event.preventDefault(); event.stopImmediatePropagation();
       if (key === 'f') sendRtsCommand('rts_stance', { stance: 'fire_at_will' });
       else if (key === 'z') sendRtsCommand('rts_stance', { stance: 'return_fire' });
@@ -1246,10 +1421,13 @@
   }
 
   window.addEventListener('keydown', handleRtsKeys, true);
-  window.addEventListener('ara:rtsSnapshot', updateRtsDisplay);
+  window.addEventListener('ara:rtsSnapshot', event => {
+    if (event.detail?.stopped === true && rtsStandalone) { closeRtsCommandView(); return; }
+    updateRtsDisplay();
+  });
   window.addEventListener('message', event => {
     if (event.data?.action === 'close') closeRtsCommandView();
-    if (event.data?.action === 'session' && event.data.payload?.state !== 'active') closeRtsCommandView();
+    if (event.data?.action === 'session' && event.data.payload?.state !== 'active' && !rtsStandalone) closeRtsCommandView();
   });
 
   function renderEncounterManager(panel, story) {
@@ -1554,15 +1732,38 @@
     document.head.append(style);
   }
 
+  function ensureStandaloneRtsLauncher(content) {
+    if (!content) return;
+    if (document.getElementById('rts-sandbox-launcher')) return;
+    const card = element('div', undefined, 'card');
+    card.id = 'rts-sandbox-launcher';
+    card.append(element('h3', 'Standalone RTS sandbox'), element('p', 'Command spawned NPCs and deploy allowlisted props or weapon pickups without running a story.', 'muted'));
+    const state = storyteller.getState() || {};
+    const enabled = state.rts?.enabled === true && state.encounters?.enabled === true && state.rts?.allowStandalone === true;
+    const live = state.session?.state === 'active';
+    const sandboxActive = state.rts?.sandboxActive === true;
+    const button = element('button', sandboxActive ? 'Open standalone RTS sandbox' : 'Start standalone RTS sandbox');
+    button.type = 'button';
+    button.disabled = (!enabled && !sandboxActive) || live;
+    button.onclick = () => openRtsCommandView({ id: null, spawnPoints: [] }, true);
+    card.append(button);
+    if (!enabled) card.append(element('p', 'Enable Config.Encounters.enabled, Config.Rts.enabled, and Config.Rts.allowStandalone, then grant the encounters ACE.', 'muted'));
+    else if (live) card.append(element('p', 'End the live story session before starting standalone RTS.', 'muted'));
+    else if (sandboxActive) card.append(element('p', 'The sandbox remains active when you close this view. Use Stop RTS to remove its tracked entities.', 'muted'));
+    content.prepend(card);
+  }
+
   function enhance() {
     const story = currentStory();
+    const content = document.getElementById('content');
+    ensureStandaloneRtsLauncher(content);
     if (!story?.id) {
       document.getElementById('flow-editor')?.remove();
       activeStoryId = null;
       selectedNodeId = null;
       return;
     }
-    if (!document.getElementById('content')) return;
+    if (!content) return;
     if (document.getElementById('flow-editor')) return;
     renderEditor();
   }
