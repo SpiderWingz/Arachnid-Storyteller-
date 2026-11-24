@@ -5,7 +5,7 @@ lua54 'yes'
 
 author 'Arachnid'
 description 'Arachnid Storyteller — a RedM gamemaster story and scene planning console'
-version '0.4.0'
+version '0.5.0'
 
 shared_script 'config.lua'
 client_script 'client.lua'

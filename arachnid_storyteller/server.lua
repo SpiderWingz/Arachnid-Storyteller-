@@ -122,16 +122,56 @@ local function sceneRecord(id)
   return type(rows) == 'table' and rows[1] or nil
 end
 
-local function sessionPayload(mode)
-  if not activeSession then
+local function onlinePlayers()
+  local players = {}
+  for _, rawId in ipairs(GetPlayers()) do
+    local id = tonumber(rawId)
+    if id and GetPlayerName(rawId) then
+      players[#players + 1] = { id = id, name = GetPlayerName(rawId) }
+    end
+  end
+  table.sort(players, function(left, right) return left.id < right.id end)
+  return players
+end
+
+local function validatedAudience(rawMode, rawIds)
+  local mode = rawMode == 'selected' and 'selected' or 'all'
+  if mode == 'all' then return { mode = 'all', participants = {} } end
+  if type(rawIds) ~= 'table' then return nil, 'Choose at least one online participant.' end
+  local participants, seen = {}, {}
+  for _, rawId in ipairs(rawIds) do
+    local id = positiveInteger(rawId)
+    if id and not seen[id] and GetPlayerName(id) then
+      seen[id] = true
+      participants[#participants + 1] = id
+      if #participants > Config.Session.maxParticipants then
+        return nil, 'Too many selected participants.'
+      end
+    end
+  end
+  if #participants == 0 then return nil, 'Choose at least one online participant.' end
+  return { mode = 'selected', participants = participants }
+end
+
+local function isAudienceMember(session, src)
+  if not session or not session.audience or session.audience.mode == 'all' then return true end
+  for _, id in ipairs(session.audience.participants or {}) do
+    if tonumber(id) == tonumber(src) then return true end
+  end
+  return false
+end
+
+local function sessionPayload(mode, session)
+  local current = session or activeSession
+  if not current then
     return { state = 'idle', mode = mode, duration = Config.Session.overlayDuration }
   end
-  local scene = activeSession.scenes[activeSession.sceneIndex]
+  local scene = current.scenes[current.sceneIndex]
   return {
     state = 'active',
     mode = mode,
     duration = Config.Session.overlayDuration,
-    story = { id = activeSession.storyId, title = activeSession.storyTitle },
+    story = { id = current.storyId, title = current.storyTitle },
     scene = scene and {
       id = scene.id,
       title = scene.title,
@@ -141,9 +181,13 @@ local function sessionPayload(mode)
       y = scene.y,
       z = scene.z
     } or nil,
-    objective = activeSession.objective,
-    startedAt = activeSession.startedAt,
-    startedBy = activeSession.startedBy
+    objective = current.objective,
+    audience = {
+      mode = current.audience and current.audience.mode or 'all',
+      count = current.audience and current.audience.mode == 'selected' and #(current.audience.participants or {}) or #GetPlayers()
+    },
+    startedAt = current.startedAt,
+    startedBy = current.startedBy
   }
 end
 
@@ -160,9 +204,16 @@ local function activateSessionScene(index, actor)
   return scene
 end
 
-local function broadcastSession(mode)
-  if Config.Session.broadcastToPlayers then
-    TriggerClientEvent('arachnid_storyteller:session', -1, sessionPayload(mode))
+local function broadcastSession(mode, session)
+  if not Config.Session.broadcastToPlayers then return end
+  local current = session or activeSession
+  local payload = mode == 'ended' and { state = 'idle', mode = mode, duration = Config.Session.overlayDuration } or sessionPayload(mode, current)
+  if current and current.audience and current.audience.mode == 'selected' then
+    for _, id in ipairs(current.audience.participants or {}) do
+      if GetPlayerName(id) then TriggerClientEvent('arachnid_storyteller:session', id, payload) end
+    end
+  else
+    TriggerClientEvent('arachnid_storyteller:session', -1, payload)
   end
 end
 
@@ -207,6 +258,7 @@ local function snapshot()
   return {
     stories = stories,
     session = activeSession and sessionPayload('snapshot') or nil,
+    players = onlinePlayers(),
     camera = {
       defaultPlacementDistance = Config.Camera.Tool.defaultPlacementDistance,
       maxPlacementDistance = Config.Camera.Tool.maxPlacementDistance,
@@ -251,7 +303,7 @@ RegisterNetEvent('arachnid_storyteller:requestData', function()
 end)
 
 RegisterNetEvent('arachnid_storyteller:requestSession', function()
-  if Config.Session.broadcastToPlayers and activeSession then
+  if Config.Session.broadcastToPlayers and activeSession and isAudienceMember(activeSession, source) then
     TriggerClientEvent('arachnid_storyteller:session', source, sessionPayload('sync'))
   end
 end)
@@ -344,12 +396,14 @@ RegisterNetEvent('arachnid_storyteller:cameraPointDelete', function(rawId)
   feedback(src, 'Camera point deleted.')
 end)
 
-RegisterNetEvent('arachnid_storyteller:sessionStart', function(rawStoryId)
+RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
   local src = source
   if not canManage(src) or not databaseReady then return end
-  local storyId = positiveInteger(rawStoryId)
+  local storyId = positiveInteger(type(raw) == 'table' and raw.storyId or raw)
   if not storyId then return feedback(src, 'Invalid story identifier.') end
   if activeSession then return feedback(src, 'A live session is already running. End it before starting another.') end
+  local audience, audienceError = validatedAudience(type(raw) == 'table' and raw.audienceMode or 'all', type(raw) == 'table' and raw.participantIds or nil)
+  if not audience then return feedback(src, audienceError) end
   local ok, story, reason = pcall(storyForSession, storyId)
   if not ok or not story then return feedback(src, 'Session start failed: ' .. tostring(ok and reason or story)) end
   activeSession = {
@@ -357,11 +411,12 @@ RegisterNetEvent('arachnid_storyteller:sessionStart', function(rawStoryId)
     storyTitle = story.title,
     scenes = story.scenes,
     sceneIndex = 1,
+    audience = audience,
     startedAt = os.time(),
     startedBy = actorName(src)
   }
   activateSessionScene(1, actorName(src))
-  logAction(src, ('Started live session for story #%s: %s'):format(tostring(story.id), story.title:sub(1, 80)))
+  logAction(src, ('Started live session for story #%s (%s audience): %s'):format(tostring(story.id), audience.mode, story.title:sub(1, 80)))
   broadcastSession('started')
   feedback(src, 'Live session started at scene 1 of ' .. #story.scenes .. '.')
 end)
@@ -402,7 +457,7 @@ RegisterNetEvent('arachnid_storyteller:sessionStop', function()
   local ended = activeSession
   activeSession = nil
   logAction(src, ('Ended live session for story #%s: %s'):format(tostring(ended.storyId), ended.storyTitle:sub(1, 80)))
-  broadcastSession('ended')
+  broadcastSession('ended', ended)
   feedback(src, 'Live session ended.')
 end)
 
@@ -437,6 +492,16 @@ RegisterNetEvent('arachnid_storyteller:sessionObjectiveStatus', function(rawStat
   logAction(src, ('Marked live objective %s for story #%s'):format(status, tostring(activeSession.storyId)))
   broadcastSession('objective_' .. status)
   feedback(src, 'Live objective marked ' .. status .. '.')
+end)
+
+AddEventHandler('playerDropped', function()
+  if not activeSession or not activeSession.audience or activeSession.audience.mode ~= 'selected' then return end
+  local leaving = tonumber(source)
+  for index = #activeSession.audience.participants, 1, -1 do
+    if tonumber(activeSession.audience.participants[index]) == leaving then
+      table.remove(activeSession.audience.participants, index)
+    end
+  end
 end)
 
 RegisterNetEvent('arachnid_storyteller:storySave', function(raw)
@@ -484,8 +549,9 @@ RegisterNetEvent('arachnid_storyteller:storyDelete', function(rawId)
   end)
   if not ok or not title then return feedback(src, 'Story deletion failed: ' .. tostring(ok and reason or title)) end
   if activeSession and tonumber(activeSession.storyId) == id then
+    local ended = activeSession
     activeSession = nil
-    broadcastSession('ended')
+    broadcastSession('ended', ended)
   end
   logAction(src, ('Deleted story #%d and its scene beats: %s'):format(id, tostring(title):sub(1, 80)))
   feedback(src, 'Story and its scene beats deleted.')

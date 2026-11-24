@@ -23,7 +23,8 @@ Config.Limits = {
 Config.Session = {
   broadcastToPlayers = true,
   overlayDuration = 12000,
-  requirePublishedStory = true
+  requirePublishedStory = true,
+  maxParticipants = 64
 }
 
 -- Camera rails are authored as ordered, persistent shot points. Playback and

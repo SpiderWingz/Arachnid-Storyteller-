@@ -90,7 +90,7 @@ end)
 
 RegisterNUICallback('sessionStart', function(data, cb)
   if opened and type(data) == 'table' then
-    TriggerServerEvent('arachnid_storyteller:sessionStart', data.storyId)
+    TriggerServerEvent('arachnid_storyteller:sessionStart', data)
   end
   cb({ ok = true })
 end)
