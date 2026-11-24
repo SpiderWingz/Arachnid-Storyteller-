@@ -16,6 +16,7 @@ Arachnid Storyteller is a standalone RedM gamemaster foundation. Its panel takes
 - Add opt-in flow actions for messages, health, armor, weapons, freeze, teleport, kill, VORP respawn, and active-job changes.
 - Play a scene's existing camera rail locally for preview or to the current live-session audience, manually or from a flow; pause and stop playback.
 - Configure per-scene freeze, HUD, letterbox, loop, fade, and default FOV settings for cutscenes.
+- Run NPC patrol routes and open a separate RTS command view to select spawned units and issue move, patrol, stop, stance, target, and configured weapon orders.
 - Capture named teleport destinations for each story at the storyteller's server-verified position and heading.
 - Spawn allowlisted NPCs, NPC groups, and props at story-specific server-captured markers; set hostility, targets, patrol routes, and death waits.
 - Control only registered world targets with owner-approved operations and explicit restore/persist behavior.
@@ -120,15 +121,32 @@ Grant `arachnid.storyteller.encounters` and set `Config.Encounters.enabled = tru
 
 ```lua
 Config.Encounters.pedModels = {
-  a_m_m_farmer_01 = { label = 'Farmer', maxHealth = 200 }
+  a_m_m_farmer_01 = { label = 'Farmer', maxHealth = 200, weapons = { 'WEAPON_REVOLVER_CATTLEMAN' } }
 }
 
 Config.Encounters.propModels = {
   p_campfire01x = { label = 'Campfire' }
 }
+
+Config.Encounters.weapons = {
+  WEAPON_REVOLVER_CATTLEMAN = { label = 'Cattleman revolver', ammo = 60 }
+}
+
+Config.Rts.enabled = true
+Config.Rts.maxOrderDistance = 1000
+Config.Rts.autoEngage = true
+Config.Rts.autoEngageRange = 75
 ```
 
 Use the **NPC**, **Prop**, or **Patrol waypoint** marker type in the story editor. The server captures each marker's position and heading from the storyteller's current in-game character. Markers are stored in `arachnid_storyteller_spawn_points`; live sessions use a start-time snapshot. Manual controls and flow nodes can spawn one NPC or a group, remove Arachnid-spawned NPCs/props, make NPCs hostile, select session participants as targets, author ordered patrol routes from saved waypoints, and wait for one/all tracked NPCs to die. `Config.Encounters.cleanupOnEnd` defaults to true. The resource also deletes tracked entities when it stops. OneSync server entity creation is required. Spawned entities are networked/shared with nearby players, including players outside the session audience.
+
+### Separate NPC RTS command view
+
+The RTS view is a separate live-session tool, opened from the NPC encounter panel. Enable both `Config.Encounters.enabled` and `Config.Rts.enabled`, then grant the storyteller the `arachnid.storyteller.encounters` ACE. It only commands Arachnid-spawned NPCs tracked by the current session. The board is a schematic top-down view of current NPCs, saved patrol waypoints, and connected session participants; it is not an in-world map texture. Select units on the board or roster, then right-click the board for a direct move order (Shift + right-click uses the fastest configured pace), move to a saved waypoint, compose a looping patrol route, stop/hold, attack a connected session participant, or set a combat stance. Use the wheel or zoom buttons to scale the board, middle-drag to pan, and **Fit units** to recenter. Weapon toggles are available for the server-configured weapons on selected NPCs.
+
+Fire at Will automatically assigns the nearest connected session participant within `Config.Rts.autoEngageRange` (75 meters by default) while the RTS mode is enabled. This is a server-side distance check, not a line-of-sight check. Return Fire holds until a session participant damages that NPC, and Hold Fire stops its attack order. The `F`, `Z`, and `H` keys switch stances; `Q` attacks the chosen participant; `Space` stops selected units; `Esc` closes the RTS view. Movement pace, patrol dwell, and `Config.Rts.maxOrderDistance` are validated on the server. Set `Config.Rts.autoEngage = false` to require manual target orders. Add NPC weapons to each ped model's `weapons` entry and `Config.Encounters.weapons`; both lists must allow the weapon before it can be toggled. The RTS view is disabled by default. If the session ends, active NPC orders are cleared even when `cleanupOnEnd` is false.
+
+See [TESTING.md](TESTING.md) for the RedM live-server checklist.
 
 ## Registered world controls
 

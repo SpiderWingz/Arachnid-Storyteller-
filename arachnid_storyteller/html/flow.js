@@ -8,6 +8,12 @@
   let editingTeleportId = null;
   let cutsceneSceneId = null;
   let editingSpawnPointId = null;
+  let rtsOverlay = null;
+  let rtsSnapshotTimer = null;
+  let rtsStoryId = null;
+  let rtsStory = null;
+  let selectedRtsUnits = new Set();
+  let rtsPatrolRoute = [];
   let pendingConnection = null;
   let idCounter = 0;
   let saveMessage = '';
@@ -45,6 +51,7 @@
     { type: 'make_npc_hostile', label: 'Make NPCs Hostile', inputs: true, outputs: ['next'] },
     { type: 'set_npc_target', label: 'Set NPC Target', inputs: true, outputs: ['next'] },
     { type: 'patrol_route', label: 'Patrol Route', inputs: true, outputs: ['next'] },
+    { type: 'stop_patrol', label: 'Stop NPC Orders', inputs: true, outputs: ['next'] },
     { type: 'spawn_prop', label: 'Spawn Prop', inputs: true, outputs: ['next'] },
     { type: 'delete_prop', label: 'Delete Spawned Props', inputs: true, outputs: ['next'] },
     { type: 'door_open', label: 'Open Registered Door', inputs: true, outputs: ['next'] },
@@ -410,7 +417,8 @@
       case 'wait_npcs_dead': return 'Waits until all tracked NPCs are dead';
       case 'make_npc_hostile': return 'Targets a connected session participant';
       case 'set_npc_target': return data.target === 'all' ? 'Distribute targets across audience players' : 'Choose one random audience player';
-      case 'patrol_route': return (data.markerIds || []).length + ' patrol waypoints';
+      case 'patrol_route': return (data.markerIds || []).length + ' patrol waypoints · ' + Number(data.speed || 1) + ' pace';
+      case 'stop_patrol': return 'Stops movement and combat orders for tracked NPCs';
       case 'door_open': case 'door_close': case 'door_lock': case 'door_unlock': case 'entity_enable': case 'entity_disable': case 'trigger_entity':
         return storyteller.getState()?.world?.targets?.find(target => String(target.id) === String(data.targetId))?.label || 'Choose a registered target';
       case 'play_sound': case 'stop_sound': return storyteller.getState()?.effects?.sounds?.find(sound => sound.id === data.soundId)?.label || 'Choose an allowlisted sound';
@@ -654,7 +662,10 @@
       };
       editor.append(field('Add waypoint to ordered route', control), addWaypoint, routeList);
       renderRoute();
-      numberField('Seconds at each waypoint', 'waitSeconds', 3, 1, Number(state.encounters?.maxPatrolWaitSeconds || 300), '1');
+      numberField('Movement pace', 'speed', Number(state.encounters?.defaultPatrolSpeed || 1), Number(state.encounters?.minPatrolSpeed || 0.5), Number(state.encounters?.maxPatrolSpeed || 3), '0.1');
+      numberField('Seconds at each waypoint', 'waitSeconds', 3, 0, Number(state.encounters?.maxPatrolWaitSeconds || 300), '1');
+    } else if (flowNode.type === 'stop_patrol') {
+      editor.append(element('p', 'Stops patrol and combat orders for every NPC tracked by the active session.', 'muted'));
     } else if (flowNode.type === 'remove_npc' || flowNode.type === 'delete_prop' || flowNode.type === 'make_npc_hostile' || flowNode.type === 'wait_npc_death' || flowNode.type === 'wait_npcs_dead') {
       const messages = {
         remove_npc: 'Removes all NPCs spawned by Arachnid in this session.',
@@ -885,6 +896,362 @@
     panel.append(section);
   }
 
+  let rtsCanvas = null;
+  let rtsRoster = null;
+  let rtsSelectionSummary = null;
+  let rtsWeaponPanel = null;
+  let rtsTargetPicker = null;
+  let rtsSpeedControl = null;
+  let rtsDwellControl = null;
+  let rtsWaypointPicker = null;
+  let rtsRouteList = null;
+  let rtsSnapshot = null;
+  let rtsView = null;
+  let rtsPan = null;
+
+  function closeRtsCommandView() {
+    if (rtsSnapshotTimer) clearInterval(rtsSnapshotTimer);
+    rtsSnapshotTimer = null;
+    rtsOverlay?.remove();
+    rtsOverlay = null;
+    rtsStoryId = null;
+    rtsStory = null;
+    rtsCanvas = rtsRoster = rtsSelectionSummary = rtsWeaponPanel = null;
+    rtsTargetPicker = rtsSpeedControl = rtsDwellControl = rtsWaypointPicker = rtsRouteList = null;
+    rtsView = rtsPan = null;
+    selectedRtsUnits.clear();
+    rtsPatrolRoute = [];
+  }
+
+  function sendRtsCommand(action, extra = {}) {
+    const ids = [...selectedRtsUnits];
+    if (!ids.length) return;
+    storyteller.send('sessionEncounterAction', { action, npcIds: ids, ...extra });
+  }
+
+  function openRtsCommandView(story) {
+    if (!story?.id) return;
+    if (rtsOverlay && Number(rtsStoryId) === Number(story.id)) return;
+    closeRtsCommandView();
+    rtsStoryId = Number(story.id);
+    rtsStory = story;
+    selectedRtsUnits.clear();
+    rtsPatrolRoute = [];
+    rtsSnapshot = null;
+    const currentState = storyteller.getState();
+    if (currentState) currentState.rtsSnapshot = null;
+    rtsOverlay = element('div', undefined, 'rts-overlay');
+    rtsOverlay.id = 'npc-rts-command-view';
+    const shell = element('div', undefined, 'rts-shell');
+    const header = element('header', undefined, 'rts-header');
+    const heading = element('div');
+    heading.append(element('small', 'ARACHNID STORYTELLER · LIVE TACTICAL CONTROL'), element('h2', 'NPC RTS COMMAND VIEW'), element('p', 'Select Arachnid NPC units, then issue orders from the tactical board and command bar.', 'muted'));
+    const close = element('button', 'Close RTS view'); close.type = 'button'; close.onclick = closeRtsCommandView;
+    header.append(heading, close);
+    const layout = element('div', undefined, 'rts-layout');
+    const boardPanel = element('section', undefined, 'rts-board-panel');
+    const boardHeader = element('div', undefined, 'rts-board-heading');
+    boardHeader.append(element('h3', 'Tactical board'), element('span', 'Left-click units to select · Right-click ground to move · Shift + right-click to move fast', 'muted'));
+    const mapControls = element('div', undefined, 'rts-map-controls');
+    const zoomOut = element('button', '−'); zoomOut.type = 'button'; zoomOut.title = 'Zoom out'; zoomOut.onclick = () => changeRtsZoom(1 / 1.2);
+    const zoomIn = element('button', '+'); zoomIn.type = 'button'; zoomIn.title = 'Zoom in'; zoomIn.onclick = () => changeRtsZoom(1.2);
+    const fitBoard = element('button', 'Fit units'); fitBoard.type = 'button'; fitBoard.onclick = fitRtsBoard;
+    mapControls.append(zoomOut, zoomIn, fitBoard);
+    boardHeader.append(mapControls);
+    rtsCanvas = document.createElement('canvas'); rtsCanvas.className = 'rts-board'; rtsCanvas.width = 1100; rtsCanvas.height = 650;
+    rtsCanvas.addEventListener('contextmenu', event => event.preventDefault());
+    rtsCanvas.addEventListener('click', event => handleRtsBoardClick(event, false));
+    rtsCanvas.addEventListener('contextmenu', event => { event.preventDefault(); handleRtsBoardClick(event, true); });
+    rtsCanvas.addEventListener('wheel', event => {
+      event.preventDefault();
+      const rect = rtsCanvas.getBoundingClientRect();
+      changeRtsZoom(event.deltaY < 0 ? 1.15 : 1 / 1.15, (event.clientX - rect.left) * (rtsCanvas.width / rect.width), (event.clientY - rect.top) * (rtsCanvas.height / rect.height));
+    }, { passive: false });
+    rtsCanvas.addEventListener('pointerdown', event => {
+      if (event.button !== 1 || !rtsView) return;
+      event.preventDefault(); rtsCanvas.setPointerCapture(event.pointerId);
+      rtsPan = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    });
+    rtsCanvas.addEventListener('pointermove', event => {
+      if (!rtsPan || rtsPan.pointerId !== event.pointerId || !rtsView) return;
+      const rect = rtsCanvas.getBoundingClientRect();
+      const dx = (event.clientX - rtsPan.x) * (rtsCanvas.width / rect.width);
+      const dy = (event.clientY - rtsPan.y) * (rtsCanvas.height / rect.height);
+      rtsView.centerX -= dx / rtsView.scale; rtsView.centerY += dy / rtsView.scale;
+      rtsPan.x = event.clientX; rtsPan.y = event.clientY;
+      drawRtsBoard(rtsSnapshot);
+    });
+    rtsCanvas.addEventListener('pointerup', event => { if (rtsPan?.pointerId === event.pointerId) rtsPan = null; });
+    rtsCanvas.addEventListener('pointercancel', () => { rtsPan = null; });
+    rtsSelectionSummary = element('p', 'No NPCs selected.', 'muted');
+    boardPanel.append(boardHeader, rtsCanvas, element('p', 'NPCs: red · selected units: gold · patrol waypoints: diamonds · audience players: blue', 'muted'), rtsSelectionSummary);
+    const rosterPanel = element('aside', undefined, 'rts-roster-panel');
+    rosterPanel.append(element('h3', 'Session units'));
+    rtsRoster = element('div', undefined, 'rts-roster');
+    rosterPanel.append(rtsRoster);
+    layout.append(boardPanel, rosterPanel);
+
+    const commandBar = element('section', undefined, 'rts-command-bar');
+    const selectionControls = element('div', undefined, 'rts-command-section');
+    selectionControls.append(element('h3', 'Selection'));
+    const selectAll = element('button', 'Select all living NPCs'); selectAll.type = 'button';
+    selectAll.onclick = () => { for (const unit of rtsSnapshot?.units || []) if (unit.alive) selectedRtsUnits.add(String(unit.id)); updateRtsDisplay(); };
+    const clearSelection = element('button', 'Clear selection'); clearSelection.type = 'button';
+    clearSelection.onclick = () => { selectedRtsUnits.clear(); updateRtsDisplay(); };
+    selectionControls.append(selectAll, clearSelection);
+
+    const movement = element('div', undefined, 'rts-command-section');
+    movement.append(element('h3', 'Movement orders'));
+    rtsWaypointPicker = selectControl([{ value: '', label: 'Choose saved waypoint' }, ...(story.spawnPoints || []).filter(point => point.kind === 'patrol').map(point => ({ value: point.id, label: point.label }))], '');
+    rtsSpeedControl = inputControl(Number(storyteller.getState()?.encounters?.defaultPatrolSpeed || 1), 'number', Number(storyteller.getState()?.encounters?.minPatrolSpeed || 0.5), Number(storyteller.getState()?.encounters?.maxPatrolSpeed || 3), '0.1');
+    rtsDwellControl = inputControl(3, 'number', 0, Number(storyteller.getState()?.encounters?.maxPatrolWaitSeconds || 300), '1');
+    const moveButton = element('button', 'Move selected to waypoint'); moveButton.type = 'button';
+    moveButton.onclick = () => rtsWaypointPicker.value && sendRtsCommand('rts_move', { markerId: Number(rtsWaypointPicker.value), speed: Number(rtsSpeedControl.value) });
+    const fastMoveButton = element('button', 'Fast move to waypoint'); fastMoveButton.type = 'button';
+    fastMoveButton.onclick = () => rtsWaypointPicker.value && sendRtsCommand('rts_move', { markerId: Number(rtsWaypointPicker.value), speed: Number(storyteller.getState()?.encounters?.maxPatrolSpeed || rtsSpeedControl.max) });
+    const patrolButton = element('button', 'Patrol selected route'); patrolButton.type = 'button';
+    patrolButton.onclick = () => sendRtsCommand('rts_patrol', { markerIds: rtsPatrolRoute.slice(), speed: Number(rtsSpeedControl.value), waitSeconds: Number(rtsDwellControl.value) });
+    const stopButton = element('button', 'Stop / hold selected', 'danger'); stopButton.type = 'button';
+    stopButton.onclick = () => sendRtsCommand('rts_stop');
+    movement.append(field('Single move target', rtsWaypointPicker), field('Movement pace', rtsSpeedControl), field('Patrol dwell seconds', rtsDwellControl), moveButton, fastMoveButton);
+    const routePicker = selectControl([{ value: '', label: 'Add route waypoint' }, ...(story.spawnPoints || []).filter(point => point.kind === 'patrol').map(point => ({ value: point.id, label: point.label }))], '');
+    const addRoute = element('button', 'Add waypoint'); addRoute.type = 'button';
+    rtsRouteList = element('div', undefined, 'flow-route-list');
+    addRoute.onclick = () => { const id = Number(routePicker.value); if (id && !rtsPatrolRoute.includes(id)) { rtsPatrolRoute.push(id); renderRtsRouteList(); } };
+    movement.append(field('Ordered patrol route', routePicker), addRoute, rtsRouteList, patrolButton, stopButton);
+
+    const combat = element('div', undefined, 'rts-command-section');
+    combat.append(element('h3', 'Engagement'));
+    rtsTargetPicker = selectControl([{ value: '', label: 'Choose session participant' }, ...(rtsSnapshot?.players || []).map(player => ({ value: player.id, label: player.name + ' (#' + player.id + ')' }))], '');
+    const targetButton = element('button', 'Attack selected participant'); targetButton.type = 'button';
+    targetButton.onclick = () => rtsTargetPicker.value && sendRtsCommand('rts_target', { targetPlayerId: Number(rtsTargetPicker.value) });
+    const stances = element('div', undefined, 'rts-stances');
+    for (const [stance, label, hotkey] of [['fire_at_will', 'Fire at Will · F', 'F'], ['return_fire', 'Return Fire · Z', 'Z'], ['hold_fire', 'Hold Fire · H', 'H']]) {
+      const button = element('button', label); button.type = 'button'; button.dataset.stance = stance;
+      button.onclick = () => sendRtsCommand('rts_stance', { stance });
+      stances.append(button);
+    }
+    combat.append(field('Target', rtsTargetPicker), targetButton, stances, element('h4', 'Configured weapons'), element('div', undefined, 'muted'));
+    rtsWeaponPanel = combat.lastElementChild;
+    const weaponInfo = element('p', 'Weapon toggles appear for weapons configured on every selected NPC.', 'muted');
+    combat.append(weaponInfo);
+    commandBar.append(selectionControls, movement, combat);
+    const help = element('p', 'Hotkeys while this view is open: F fire at will · Z return fire · H hold fire · Q attack chosen participant · Space stop selected units · Esc close.', 'muted');
+    shell.append(header, layout, commandBar, help);
+    rtsOverlay.append(shell);
+    document.body.append(rtsOverlay);
+    renderRtsRouteList();
+    updateRtsDisplay();
+    storyteller.send('requestRtsSnapshot');
+    const interval = Number(storyteller.getState()?.rts?.snapshotIntervalMs) || 1200;
+    rtsSnapshotTimer = setInterval(() => {
+      const state = storyteller.getState();
+      if (!rtsOverlay || !state || state.session?.state !== 'active' || Number(state.session.story?.id) !== Number(rtsStoryId)) {
+        closeRtsCommandView();
+        return;
+      }
+      storyteller.send('requestRtsSnapshot');
+    }, Math.max(700, interval));
+  }
+
+  function renderRtsRouteList() {
+    if (!rtsRouteList) return;
+    const markers = rtsStory?.spawnPoints?.filter(point => point.kind === 'patrol') || [];
+    rtsRouteList.replaceChildren();
+    if (!rtsPatrolRoute.length) rtsRouteList.append(element('p', 'Add at least two ordered waypoints for a looped patrol.', 'muted'));
+    rtsPatrolRoute.forEach((id, index) => {
+      const marker = markers.find(point => Number(point.id) === id);
+      if (!marker) return;
+      const row = element('div', undefined, 'flow-route-row'); row.append(element('span', (index + 1) + '. ' + marker.label));
+      const up = element('button', '↑'); up.type = 'button'; up.disabled = index === 0;
+      up.onclick = () => { [rtsPatrolRoute[index - 1], rtsPatrolRoute[index]] = [rtsPatrolRoute[index], rtsPatrolRoute[index - 1]]; renderRtsRouteList(); };
+      const down = element('button', '↓'); down.type = 'button'; down.disabled = index === rtsPatrolRoute.length - 1;
+      down.onclick = () => { [rtsPatrolRoute[index], rtsPatrolRoute[index + 1]] = [rtsPatrolRoute[index + 1], rtsPatrolRoute[index]]; renderRtsRouteList(); };
+      const remove = element('button', '×'); remove.type = 'button'; remove.onclick = () => { rtsPatrolRoute.splice(index, 1); renderRtsRouteList(); };
+      row.append(up, down, remove); rtsRouteList.append(row);
+    });
+  }
+
+  function fitRtsBoard() {
+    rtsView = null;
+    drawRtsBoard(rtsSnapshot);
+  }
+
+  function changeRtsZoom(factor, anchorX, anchorY) {
+    if (!rtsCanvas) return;
+    if (!rtsView) drawRtsBoard(rtsSnapshot);
+    if (!rtsView) return;
+    const width = rtsCanvas.width, height = rtsCanvas.height;
+    const px = anchorX == null ? width / 2 : anchorX;
+    const py = anchorY == null ? height / 2 : anchorY;
+    const worldX = rtsView.centerX + (px - width / 2) / rtsView.scale;
+    const worldY = rtsView.centerY - (py - height / 2) / rtsView.scale;
+    const nextScale = Math.max(0.001, Math.min(8, rtsView.scale * factor));
+    rtsView.centerX = worldX - (px - width / 2) / nextScale;
+    rtsView.centerY = worldY + (py - height / 2) / nextScale;
+    rtsView.scale = nextScale;
+    drawRtsBoard(rtsSnapshot);
+  }
+
+  function handleRtsBoardClick(event, orderMove) {
+    if (!rtsCanvas || !rtsSnapshot) return;
+    const rect = rtsCanvas.getBoundingClientRect();
+    const px = (event.clientX - rect.left) * (rtsCanvas.width / rect.width);
+    const py = (event.clientY - rect.top) * (rtsCanvas.height / rect.height);
+    const points = rtsCanvas._rtsPoints || {};
+    if (!orderMove) {
+      const nearest = (points.units || []).map(item => ({ item, distance: Math.hypot(item.px - px, item.py - py) })).filter(item => item.distance <= 25).sort((a, b) => a.distance - b.distance)[0];
+      if (nearest) {
+        const id = String(nearest.item.unit.id);
+        if (selectedRtsUnits.has(id)) selectedRtsUnits.delete(id); else selectedRtsUnits.add(id);
+        updateRtsDisplay();
+      }
+      return;
+    }
+    if (!selectedRtsUnits.size) return;
+    const projection = rtsCanvas._rtsProjection;
+    if (!projection || !Number.isFinite(projection.scale) || projection.scale <= 0) return;
+    const elevatedWorld = projection.world.filter(item => Number.isFinite(Number(item.z)));
+    const nearestWorld = elevatedWorld.reduce((nearest, item) => {
+      const distance = Math.hypot(Number(item.x) - (projection.centerX + (px - rtsCanvas.width / 2) / projection.scale), Number(item.y) - (projection.centerY - (py - rtsCanvas.height / 2) / projection.scale));
+      return !nearest || distance < nearest.distance ? { item, distance } : nearest;
+    }, null);
+    const position = {
+      x: projection.centerX + (px - rtsCanvas.width / 2) / projection.scale,
+      y: projection.centerY - (py - rtsCanvas.height / 2) / projection.scale,
+      z: Number(nearestWorld?.item?.z)
+    };
+    if (Number.isFinite(position.x) && Number.isFinite(position.y) && Number.isFinite(position.z)) {
+      const fastSpeed = Number(storyteller.getState()?.encounters?.maxPatrolSpeed || rtsSpeedControl?.max || 3);
+      sendRtsCommand('rts_move_point', { position, speed: event.shiftKey ? fastSpeed : Number(rtsSpeedControl?.value || 1) });
+    }
+  }
+
+  function drawRtsBoard(snapshot) {
+    if (!rtsCanvas) return;
+    const ctx = rtsCanvas.getContext('2d');
+    const width = rtsCanvas.width, height = rtsCanvas.height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#0c1415'; ctx.fillRect(0, 0, width, height);
+    const units = snapshot?.units || [], waypoints = snapshot?.waypoints || [], players = snapshot?.players || [];
+    const world = [...units, ...waypoints, ...players].filter(item => Number.isFinite(Number(item.x)) && Number.isFinite(Number(item.y)));
+    if (!world.length) {
+      ctx.fillStyle = '#d8c5a4'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('No tracked NPCs or patrol waypoints in this session yet.', width / 2, height / 2);
+      rtsCanvas._rtsPoints = { units: [], waypoints: [] }; return;
+    }
+    if (!rtsView) {
+      const minX = Math.min(...world.map(item => Number(item.x))), maxX = Math.max(...world.map(item => Number(item.x)));
+      const minY = Math.min(...world.map(item => Number(item.y))), maxY = Math.max(...world.map(item => Number(item.y)));
+      const spanX = Math.max(40, maxX - minX), spanY = Math.max(40, maxY - minY);
+      rtsView = {
+        centerX: (minX + maxX) / 2,
+        centerY: (minY + maxY) / 2,
+        scale: Math.max(0.001, Math.min(8, (width - 120) / spanX, (height - 120) / spanY))
+      };
+    }
+    const { centerX, centerY, scale } = rtsView;
+    const project = item => ({ px: width / 2 + (Number(item.x) - centerX) * scale, py: height / 2 - (Number(item.y) - centerY) * scale });
+    rtsCanvas._rtsProjection = { centerX, centerY, scale, world };
+    ctx.strokeStyle = '#ffffff12'; ctx.lineWidth = 1;
+    for (let x = 50; x < width; x += 50) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke(); }
+    for (let y = 50; y < height; y += 50) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke(); }
+    const projectedUnits = units.map(unit => ({ unit, ...project(unit) }));
+    const projectedWaypoints = waypoints.map(waypoint => ({ waypoint, ...project(waypoint) }));
+    for (const item of projectedUnits) {
+      const order = item.unit.order || {};
+      const routeIds = order.kind === 'patrol' && Array.isArray(order.routeMarkerIds)
+        ? order.routeMarkerIds.slice(Math.max(0, Number(order.routeIndex || 1) - 1))
+        : [order.markerId];
+      const route = order.targetCoords && order.kind === 'move'
+        ? [project(order.targetCoords)]
+        : routeIds.map(id => projectedWaypoints.find(point => Number(point.waypoint.id) === Number(id))).filter(Boolean);
+      if (route.length && ['move', 'patrol'].includes(order.kind)) {
+        ctx.strokeStyle = selectedRtsUnits.has(String(item.unit.id)) ? '#efc97b99' : '#d77c6299'; ctx.setLineDash([8, 7]);
+        ctx.beginPath(); ctx.moveTo(item.px, item.py);
+        for (const point of route) ctx.lineTo(point.px, point.py);
+        if (order.kind === 'patrol' && route.length > 1) ctx.lineTo(route[0].px, route[0].py);
+        ctx.stroke(); ctx.setLineDash([]);
+      }
+    }
+    for (const item of projectedWaypoints) {
+      ctx.fillStyle = '#e2bb72'; ctx.beginPath(); ctx.moveTo(item.px, item.py - 12); ctx.lineTo(item.px + 11, item.py); ctx.lineTo(item.px, item.py + 12); ctx.lineTo(item.px - 11, item.py); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#f1dfbf'; ctx.font = '15px sans-serif'; ctx.textAlign = 'left'; ctx.fillText(item.waypoint.label, item.px + 14, item.py + 5);
+    }
+    for (const player of players) {
+      const point = project(player);
+      ctx.fillStyle = '#74b8d9'; ctx.beginPath(); ctx.arc(point.px, point.py, 10, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#cae9f5'; ctx.font = '13px sans-serif'; ctx.textAlign = 'left'; ctx.fillText(player.name, point.px + 13, point.py + 4);
+    }
+    for (const item of projectedUnits) {
+      const selected = selectedRtsUnits.has(String(item.unit.id));
+      ctx.fillStyle = item.unit.alive ? selected ? '#f3c45f' : '#c96857' : '#666';
+      ctx.strokeStyle = selected ? '#fff1bc' : '#301a19'; ctx.lineWidth = selected ? 4 : 2;
+      ctx.beginPath(); ctx.arc(item.px, item.py, 15, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#fff7e6'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(String(item.unit.id).replace('npc-', ''), item.px, item.py + 4);
+      ctx.font = '13px sans-serif'; ctx.textAlign = 'left'; ctx.fillText(item.unit.model, item.px + 19, item.py + 4);
+    }
+    rtsCanvas._rtsPoints = { units: projectedUnits, waypoints: projectedWaypoints };
+  }
+
+  function updateRtsDisplay() {
+    if (!rtsOverlay) return;
+    const state = storyteller.getState() || {};
+    rtsSnapshot = Number(state.rtsSnapshot?.storyId) === Number(rtsStoryId) ? state.rtsSnapshot : null;
+    const units = rtsSnapshot?.units || [];
+    for (const id of [...selectedRtsUnits]) if (!units.some(unit => String(unit.id) === id && unit.alive)) selectedRtsUnits.delete(id);
+    drawRtsBoard(rtsSnapshot);
+    rtsSelectionSummary.textContent = selectedRtsUnits.size + ' unit(s) selected · ' + units.length + ' tracked in session.';
+    rtsRoster.replaceChildren();
+    if (!units.length) rtsRoster.append(element('p', 'Spawn NPCs in the live encounter panel to command them here.', 'muted'));
+    for (const unit of units) {
+      const card = element('button', undefined, 'rts-unit-card' + (selectedRtsUnits.has(String(unit.id)) ? ' selected' : ''));
+      card.type = 'button';
+      card.append(element('strong', unit.id + ' · ' + unit.model), element('span', unit.alive ? (unit.order?.status || 'holding') + ' · ' + (unit.stance || 'fire_at_will').replace(/_/g, ' ') + (Number.isFinite(Number(unit.health)) ? ' · ' + unit.health + ' HP' : '') : 'down'));
+      card.onclick = () => { const id = String(unit.id); if (selectedRtsUnits.has(id)) selectedRtsUnits.delete(id); else selectedRtsUnits.add(id); updateRtsDisplay(); };
+      rtsRoster.append(card);
+    }
+    const participantOptions = [{ value: '', label: 'Choose session participant' }, ...(rtsSnapshot?.players || []).map(player => ({ value: player.id, label: player.name + ' (#' + player.id + ')' }))];
+    const selectedTarget = rtsTargetPicker?.value;
+    if (rtsTargetPicker) {
+      rtsTargetPicker.replaceChildren(...participantOptions.map(item => { const option = element('option', item.label); option.value = String(item.value); return option; }));
+      if ([...rtsTargetPicker.options].some(option => option.value === selectedTarget)) rtsTargetPicker.value = selectedTarget;
+    }
+    rtsWeaponPanel.replaceChildren();
+    const selected = units.filter(unit => selectedRtsUnits.has(String(unit.id)));
+    if (!selected.length) rtsWeaponPanel.append(element('span', 'Select unit(s) to view configured weapons.', 'muted'));
+    else {
+      const common = (selected[0].weapons || []).filter(weapon => selected.every(unit => (unit.weapons || []).some(item => item.name === weapon.name)));
+      if (!common.length) rtsWeaponPanel.append(element('span', 'No shared owner-configured weapons on this selection.', 'muted'));
+      for (const weapon of common) {
+        const enabled = selected.every(unit => (unit.weapons || []).find(item => item.name === weapon.name)?.enabled === true);
+        const button = element('button', (enabled ? 'Disable ' : 'Enable ') + weapon.label); button.type = 'button';
+        button.onclick = () => sendRtsCommand('rts_weapon', { weapon: weapon.name, enabled: !enabled });
+        rtsWeaponPanel.append(button);
+      }
+    }
+  }
+
+  function handleRtsKeys(event) {
+    if (!rtsOverlay) return;
+    const key = event.key.toLowerCase();
+    if (key === 'escape') { event.preventDefault(); event.stopImmediatePropagation(); closeRtsCommandView(); return; }
+    if (['f', 'z', 'h', 'q', ' '].includes(key) && (event.target === document.body || event.target === rtsOverlay || !['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target?.tagName))) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (key === 'f') sendRtsCommand('rts_stance', { stance: 'fire_at_will' });
+      else if (key === 'z') sendRtsCommand('rts_stance', { stance: 'return_fire' });
+      else if (key === 'h') sendRtsCommand('rts_stance', { stance: 'hold_fire' });
+      else if (key === ' ') sendRtsCommand('rts_stop');
+      else if (key === 'q' && rtsTargetPicker?.value) sendRtsCommand('rts_target', { targetPlayerId: Number(rtsTargetPicker.value) });
+    }
+  }
+
+  window.addEventListener('keydown', handleRtsKeys, true);
+  window.addEventListener('ara:rtsSnapshot', updateRtsDisplay);
+  window.addEventListener('message', event => {
+    if (event.data?.action === 'close') closeRtsCommandView();
+    if (event.data?.action === 'session' && event.data.payload?.state !== 'active') closeRtsCommandView();
+  });
+
   function renderEncounterManager(panel, story) {
     const state = storyteller.getState() || {};
     const config = state.encounters || {};
@@ -933,7 +1300,13 @@
       section.append(element('h4', 'Live encounter controls'));
       const counts = state.session.encounters || {};
       section.append(element('p', 'Arachnid entities in this session: ' + Number(counts.npcs || 0) + ' NPC(s), ' + Number(counts.props || 0) + ' prop(s).', 'muted'));
+      const openRts = element('button', 'Open NPC RTS Command View');
+      openRts.type = 'button'; openRts.disabled = config.enabled !== true || state.rts?.enabled !== true;
+      openRts.onclick = () => openRtsCommandView(story);
+      section.append(openRts);
       if (config.enabled !== true) section.append(element('p', 'Encounter actions are disabled in server config. Enable Config.Encounters.enabled and grant the encounters ACE permission.', 'muted'));
+      else if (state.rts?.enabled !== true) section.append(element('p', 'The separate RTS command view is disabled. Enable Config.Rts.enabled and grant the encounters ACE permission.', 'muted'));
+      else section.append(element('p', 'Fire at Will NPCs automatically target the nearest connected session participant within the configured range. Set Config.Rts.autoEngage = false to require explicit attack orders.', 'muted'));
       const action = (name, labelText, data = {}) => {
         const button = element('button', labelText); button.type = 'button'; button.disabled = config.enabled !== true;
         button.onclick = () => storyteller.send('sessionEncounterAction', { action: name, ...data });

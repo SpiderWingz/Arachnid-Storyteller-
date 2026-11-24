@@ -6,6 +6,7 @@ local areaShapes = { sphere = true, box = true }
 local frozenByArachnid = {}
 local trackedEncounterEntities = {}
 local cleanupSessionEncounters
+local stopSessionNpcOrders
 local cleanupSessionWorld
 local cleanupSessionEffects
 
@@ -294,7 +295,7 @@ local flowNodeTypes = {
   play_cutscene = true, wait_cutscene = true, stop_cutscene = true,
   spawn_npc = true, spawn_npc_group = true, remove_npc = true,
   wait_npc_death = true, wait_npcs_dead = true, make_npc_hostile = true,
-  set_npc_target = true, patrol_route = true, spawn_prop = true, delete_prop = true,
+  set_npc_target = true, patrol_route = true, stop_patrol = true, spawn_prop = true, delete_prop = true,
   door_open = true, door_close = true, door_lock = true, door_unlock = true,
   entity_enable = true, entity_disable = true, trigger_entity = true,
   play_sound = true, stop_sound = true, screen_fade = true,
@@ -317,7 +318,7 @@ local flowOutputs = {
   play_cutscene = { next = true }, wait_cutscene = { next = true }, stop_cutscene = { next = true },
   spawn_npc = { next = true }, spawn_npc_group = { next = true }, remove_npc = { next = true },
   wait_npc_death = { next = true }, wait_npcs_dead = { next = true }, make_npc_hostile = { next = true },
-  set_npc_target = { next = true }, patrol_route = { next = true }, spawn_prop = { next = true }, delete_prop = { next = true },
+  set_npc_target = { next = true }, patrol_route = { next = true }, stop_patrol = { next = true }, spawn_prop = { next = true }, delete_prop = { next = true },
   door_open = { next = true }, door_close = { next = true }, door_lock = { next = true }, door_unlock = { next = true },
   entity_enable = { next = true }, entity_disable = { next = true }, trigger_entity = { next = true },
   play_sound = { next = true }, stop_sound = { next = true }, screen_fade = { next = true },
@@ -340,7 +341,7 @@ local flowFeatureNodes = {
   cutscenes = { play_cutscene = true, wait_cutscene = true, stop_cutscene = true },
   encounters = {
     spawn_npc = true, spawn_npc_group = true, remove_npc = true, wait_npc_death = true,
-    wait_npcs_dead = true, make_npc_hostile = true, set_npc_target = true, patrol_route = true,
+    wait_npcs_dead = true, make_npc_hostile = true, set_npc_target = true, patrol_route = true, stop_patrol = true,
     spawn_prop = true, delete_prop = true
   },
   world = { check_entity_alive = true, door_open = true, door_close = true, door_lock = true, door_unlock = true, entity_enable = true, entity_disable = true, trigger_entity = true },
@@ -423,6 +424,29 @@ local function allowedEncounterModel(kind, model)
   if entry == true then entry = {} end
   if type(entry) ~= 'table' or #model < 1 or #model > 100 then return nil end
   return entry
+end
+
+local function allowedEncounterWeapon(name)
+  local weapons = type(Config.Encounters.weapons) == 'table' and Config.Encounters.weapons or {}
+  local entry = type(name) == 'string' and weapons[name] or nil
+  if type(entry) ~= 'table' then return nil end
+  local ammo = boundedNumber(entry.ammo or 60, 1, Config.Encounters.maxWeaponAmmo or 1000)
+  if ammo == nil or ammo % 1 ~= 0 then return nil end
+  return { name = name, label = cleanText(entry.label or name, 100, true) or name, ammo = ammo }
+end
+
+local function encounterLoadout(modelEntry)
+  local raw = type(modelEntry) == 'table' and modelEntry.weapons or nil
+  if raw == nil then return {} end
+  if not isDenseArray(raw, 16) then return nil, 'The configured NPC weapon loadout must be a list of allowlisted weapons.' end
+  local result, seen = {}, {}
+  for _, name in ipairs(raw) do
+    local weapon = allowedEncounterWeapon(name)
+    if not weapon or seen[name] then return nil, 'The NPC loadout contains a missing or repeated weapon allowlist entry.' end
+    seen[name] = true
+    result[#result + 1] = weapon
+  end
+  return result
 end
 
 local function maxPedHealth(entry)
@@ -641,7 +665,10 @@ local function validateFlowGraph(rawGraph, storyId, requireRunnable)
         if not marker or marker.kind ~= 'patrol' then return nil, 'A patrol route references a missing waypoint marker.' end
         route[#route + 1] = markerId
       end
-      data.markerIds = route
+      local speed = boundedNumber(rawData.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+      local waitSeconds = boundedNumber(rawData.waitSeconds == nil and 3 or rawData.waitSeconds, 0, Config.Encounters.maxPatrolWaitSeconds)
+      if speed == nil or waitSeconds == nil then return nil, 'Patrol pace or waypoint dwell time exceeds the server limits.' end
+      data.markerIds, data.speed, data.waitSeconds = route, speed, waitSeconds
     elseif flowFeatureNodes.effects[kind] then
       local normalized, reason = normalizeEffectData(kind, rawData)
       if not normalized then return nil, reason end
@@ -957,6 +984,7 @@ local function endActiveSession(mode, actor)
   local ended = activeSession
   activeSession = nil
   stopSessionCutscene(ended)
+  if stopSessionNpcOrders then stopSessionNpcOrders(ended) end
   cleanupSessionEncounters(ended, false)
   cleanupSessionWorld(ended)
   cleanupSessionEffects(ended)
@@ -1077,6 +1105,153 @@ local function encounterMarker(session, markerId, kind)
   return nil
 end
 
+local function selectedEncounterNpcs(session, rawIds)
+  local all = sessionEncounterList(session, 'npc')
+  if rawIds == nil then return all end
+  if not isDenseArray(rawIds, Config.Encounters.maxNpcsPerSession) then return nil, 'Select tracked NPC units in the active session.' end
+  local byId = {}
+  for _, npc in ipairs(all) do byId[tostring(npc.id)] = npc end
+  local selected, seen = {}, {}
+  for _, rawId in ipairs(rawIds) do
+    if type(rawId) ~= 'string' or #rawId > 32 or seen[rawId] or not byId[rawId] then
+      return nil, 'An NPC selection is invalid or no longer belongs to this session.'
+    end
+    seen[rawId] = true
+    selected[#selected + 1] = byId[rawId]
+  end
+  if #selected == 0 then return nil, 'Select at least one tracked NPC.' end
+  return selected
+end
+
+local function stopNpcOrder(npc, keepTarget)
+  npc.orderToken = (npc.orderToken or 0) + 1
+  if encounterEntityExists(npc.entity) then
+    local clearTasks = type(ClearPedTasks) == 'function' and ClearPedTasks or ClearPedTasksImmediately
+    if type(clearTasks) == 'function' then pcall(clearTasks, npc.entity) end
+  end
+  npc.order = { kind = 'hold', status = 'holding' }
+  if not keepTarget then npc.targetId = nil; npc.autoTarget = false end
+end
+
+stopSessionNpcOrders = function(session)
+  if not session or not session.entities or type(session.entities.npcs) ~= 'table' then return end
+  for _, npc in ipairs(session.entities.npcs) do
+    if npc.order then stopNpcOrder(npc, false) end
+  end
+end
+
+local function npcHasEnabledWeapon(npc)
+  local states = npc.weaponStates or {}
+  if next(states) == nil then return true end
+  for _, enabled in pairs(states) do if enabled then return true end end
+  return false
+end
+
+local function taskNpcCombat(npc, targetId, allowReturnFire, automatic)
+  if not encounterEntityExists(npc.entity) or encounterEntityDead(npc.entity) then return false, 'The selected NPC is no longer alive.' end
+  if not targetId or not GetPlayerName(targetId) then return false, 'Choose a connected session participant as the target.' end
+  if npc.stance == 'hold_fire' or (npc.stance == 'return_fire' and not allowReturnFire) then
+    npc.targetId, npc.autoTarget = tonumber(targetId), automatic == true
+    return true
+  end
+  if not npcHasEnabledWeapon(npc) then return false, 'All configured weapons are disabled for this NPC.' end
+  local targetPed = GetPlayerPed(targetId)
+  if not targetPed or targetPed == 0 or type(TaskCombatPed) ~= 'function' then return false, 'RedM combat orders are unavailable for this NPC.' end
+  local ok, err = pcall(TaskCombatPed, npc.entity, targetPed, 0, 16)
+  if not ok then return false, tostring(err) end
+  if type(SetPedAsEnemy) == 'function' then pcall(SetPedAsEnemy, npc.entity, true) end
+  npc.targetId, npc.autoTarget = tonumber(targetId), automatic == true
+  npc.holdPosition = false
+  npc.order = { kind = 'attack', status = 'engaging', targetId = tonumber(targetId) }
+  return true
+end
+
+local function startNpcOrder(session, npc, route, settings)
+  if type(TaskGoStraightToCoord) ~= 'function' then return false, 'RedM NPC movement orders are unavailable on this server.' end
+  if not encounterEntityExists(npc.entity) or encounterEntityDead(npc.entity) then return false, 'The selected NPC is no longer alive.' end
+  settings = settings or {}
+  stopNpcOrder(npc, false)
+  local token = npc.orderToken
+  local copiedRoute = {}
+  for _, marker in ipairs(route) do copiedRoute[#copiedRoute + 1] = marker end
+  local orderKind = settings.loop and 'patrol' or 'move'
+  local speed = boundedNumber(settings.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+  local waitSeconds = boundedNumber(settings.waitSeconds == nil and 3 or settings.waitSeconds, 0, Config.Encounters.maxPatrolWaitSeconds)
+  if not speed or not waitSeconds then return false, 'Movement pace or waypoint dwell time exceeds the configured limits.' end
+  npc.order = { kind = orderKind, status = 'moving', markerId = copiedRoute[1].id, route = copiedRoute, routeIndex = 1, speed = speed, waitSeconds = waitSeconds }
+  npc.order.targetCoords = { x = tonumber(copiedRoute[1].x), y = tonumber(copiedRoute[1].y), z = tonumber(copiedRoute[1].z) }
+  npc.targetId, npc.holdPosition = nil, false
+
+  CreateThread(function()
+    local routeIndex = 1
+    while activeSession == session and npc.orderToken == token and encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) do
+      local marker = copiedRoute[routeIndex]
+      if not marker then break end
+      npc.order.status, npc.order.routeIndex, npc.order.markerId = 'moving', routeIndex, marker.id
+      npc.order.targetCoords = { x = tonumber(marker.x), y = tonumber(marker.y), z = tonumber(marker.z) }
+      local callOk = pcall(TaskGoStraightToCoord, npc.entity, tonumber(marker.x) + 0.0, tonumber(marker.y) + 0.0,
+        tonumber(marker.z) + 0.0, speed, -1, tonumber(marker.heading) or 0.0, tonumber(Config.Encounters.patrolArrivalRadius) or 2.0)
+      if not callOk then
+        npc.order.status = 'stuck'
+        local clearTasks = type(ClearPedTasks) == 'function' and ClearPedTasks or ClearPedTasksImmediately
+        if type(clearTasks) == 'function' then pcall(clearTasks, npc.entity) end
+        return
+      end
+      local arrived, deadline = false, GetGameTimer() + math.floor((tonumber(Config.Encounters.patrolPathTimeoutSeconds) or 180) * 1000)
+      while activeSession == session and npc.orderToken == token and GetGameTimer() < deadline do
+        if not encounterEntityExists(npc.entity) or encounterEntityDead(npc.entity) then return end
+        local okPosition, position = pcall(GetEntityCoords, npc.entity)
+        if okPosition and position then
+          local dx, dy, dz = position.x - tonumber(marker.x), position.y - tonumber(marker.y), position.z - tonumber(marker.z)
+          if math.sqrt(dx * dx + dy * dy + dz * dz) <= (tonumber(Config.Encounters.patrolArrivalRadius) or 2.0) then
+            arrived = true
+            break
+          end
+        end
+        Wait(500)
+      end
+      if activeSession ~= session or npc.orderToken ~= token then return end
+      if not arrived then
+        npc.order.status = 'stuck'
+        local clearTasks = type(ClearPedTasks) == 'function' and ClearPedTasks or ClearPedTasksImmediately
+        if type(clearTasks) == 'function' then pcall(clearTasks, npc.entity) end
+        return
+      end
+      if not settings.loop and routeIndex >= #copiedRoute then
+        npc.order = { kind = 'hold', status = 'holding', markerId = marker.id }
+        return
+      end
+      npc.order.status = 'waiting'
+      local dwellUntil = GetGameTimer() + math.floor(waitSeconds * 1000)
+      while activeSession == session and npc.orderToken == token and GetGameTimer() < dwellUntil do Wait(250) end
+      if activeSession ~= session or npc.orderToken ~= token then return end
+      routeIndex = routeIndex % #copiedRoute + 1
+    end
+  end)
+  return true
+end
+
+local function npcOrderWithinLimit(npc, route)
+  local maxDistance = boundedNumber(Config.Rts.maxOrderDistance, 1, 100000) or 1000
+  if type(GetEntityCoords) ~= 'function' or not encounterEntityExists(npc.entity) then
+    return false, 'NPC position is unavailable for validating that order.'
+  end
+  local ok, position = pcall(GetEntityCoords, npc.entity)
+  if not ok or not position then return false, 'NPC position is unavailable for validating that order.' end
+  local from = { x = tonumber(position.x), y = tonumber(position.y), z = tonumber(position.z) }
+  if not from.x or not from.y or not from.z then return false, 'NPC position is invalid.' end
+  for _, marker in ipairs(route) do
+    local to = { x = tonumber(marker.x), y = tonumber(marker.y), z = tonumber(marker.z) }
+    if not to.x or not to.y or not to.z then return false, 'A saved waypoint has invalid coordinates.' end
+    local dx, dy, dz = from.x - to.x, from.y - to.y, from.z - to.z
+    if math.sqrt(dx * dx + dy * dy + dz * dz) > maxDistance then
+      return false, ('The waypoint is farther than the configured RTS order limit (%s meters).'):format(tostring(maxDistance))
+    end
+    from = to
+  end
+  return true
+end
+
 local function deleteEncounterRecord(record)
   if not record or not encounterEntityExists(record.entity) then
     if record and record.entity then trackedEncounterEntities[tostring(record.entity)] = nil end
@@ -1110,6 +1285,9 @@ local function createEncounterNpc(session, model, marker, health, offsetIndex)
   if #npcs >= Config.Encounters.maxNpcsPerSession then return nil, 'The session reached its configured NPC limit.' end
   local entry = allowedEncounterModel('ped', model)
   if not entry then return nil, 'The ped model is not in the server allowlist.' end
+  local loadout, loadoutError = encounterLoadout(entry)
+  if not loadout then return nil, loadoutError end
+  if #loadout > 0 and type(GiveWeaponToPed) ~= 'function' then return nil, 'RedM NPC weapon control is unavailable on this server.' end
   local hash = type(model) == 'number' and model or GetHashKey(model)
   local index = tonumber(offsetIndex) or 1
   local angle = (index - 1) * 2.399963229728653
@@ -1122,7 +1300,20 @@ local function createEncounterNpc(session, model, marker, health, offsetIndex)
   if type(SetEntityOrphanMode) == 'function' then pcall(SetEntityOrphanMode, ped, 2) end
   if type(SetEntityMaxHealth) == 'function' then pcall(SetEntityMaxHealth, ped, health) end
   if type(SetEntityHealth) == 'function' then pcall(SetEntityHealth, ped, health) end
-  local record = { entity = ped, model = model, groupId = session.runtimeId .. ':npc:' .. tostring(#npcs + 1) }
+  session.nextNpcId = (session.nextNpcId or 0) + 1
+  local record = {
+    id = 'npc-' .. tostring(session.nextNpcId), entity = ped, model = model,
+    groupId = session.runtimeId .. ':npc:' .. tostring(session.nextNpcId),
+    stance = Config.Encounters.defaultStance or 'fire_at_will', weaponStates = {}
+  }
+  for _, weapon in ipairs(loadout) do
+    local okWeapon = pcall(GiveWeaponToPed, ped, GetHashKey(weapon.name), weapon.ammo, false, true)
+    if not okWeapon then
+      if type(DeleteEntity) == 'function' then pcall(DeleteEntity, ped) end
+      return nil, 'RedM could not apply the configured NPC weapon loadout.'
+    end
+    record.weaponStates[weapon.name] = true
+  end
   npcs[#npcs + 1] = record
   trackedEncounterEntities[tostring(ped)] = ped
   return record
@@ -1180,9 +1371,9 @@ local function applyEncounterAction(session, kind, data)
     for index, npc in ipairs(npcs) do
       if encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) then
         local targetId = usedTargets[((index - 1) % #usedTargets) + 1]
-        local targetPed = GetPlayerPed(targetId)
-        if targetPed and targetPed ~= 0 and type(TaskCombatPed) == 'function' then pcall(TaskCombatPed, npc.entity, targetPed, 0, 16) end
-        if type(SetPedAsEnemy) == 'function' then pcall(SetPedAsEnemy, npc.entity, true) end
+        if kind == 'make_npc_hostile' then npc.stance = 'fire_at_will' end
+        local applied, reason = taskNpcCombat(npc, targetId, false)
+        if not applied then return false, reason end
       end
     end
     return true
@@ -1194,25 +1385,232 @@ local function applyEncounterAction(session, kind, data)
       route[#route + 1] = marker
     end
     if #route < 2 then return false, 'Patrol needs at least two saved waypoints.' end
-    local waitSeconds = boundedNumber(data.waitSeconds or 3, 1, Config.Encounters.maxPatrolWaitSeconds) or 3
+    local waitSeconds = boundedNumber(data.waitSeconds == nil and 3 or data.waitSeconds, 0, Config.Encounters.maxPatrolWaitSeconds) or 3
+    local speed = boundedNumber(data.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed) or Config.Encounters.defaultPatrolSpeed
     for _, npc in ipairs(sessionEncounterList(session, 'npc')) do
       if encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) then
-        CreateThread(function()
-          while activeSession == session and encounterEntityExists(npc.entity) do
-            for _, marker in ipairs(route) do
-              if activeSession ~= session or not encounterEntityExists(npc.entity) then return end
-              if type(TaskGoStraightToCoord) == 'function' then
-                pcall(TaskGoStraightToCoord, npc.entity, tonumber(marker.x), tonumber(marker.y), tonumber(marker.z), 1.0, -1, tonumber(marker.heading) or 0, 0.0)
-              end
-              Wait(math.floor(waitSeconds * 1000))
-            end
-          end
-        end)
+        local ok, reason = startNpcOrder(session, npc, route, { loop = true, speed = speed, waitSeconds = waitSeconds })
+        if not ok then return false, reason end
       end
     end
     return true
+  elseif kind == 'stop_patrol' then
+    local selected, reason = selectedEncounterNpcs(session, data.npcIds)
+    if not selected then return false, reason end
+    for _, npc in ipairs(selected) do stopNpcOrder(npc, false); npc.holdPosition = true end
+    return true
   end
   return false, 'Unknown encounter action.'
+end
+
+local rtsStances = { fire_at_will = true, return_fire = true, hold_fire = true }
+
+local function applyRtsCommand(session, action, data)
+  local selected, selectionError = selectedEncounterNpcs(session, data.npcIds)
+  if not selected then return false, selectionError end
+  if action == 'rts_move' then
+    local marker = encounterMarker(session, data.markerId, 'patrol')
+    if not marker then return false, 'Move orders must target a saved patrol waypoint.' end
+    local speed = boundedNumber(data.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+    if not speed then return false, 'Movement pace is outside the configured limits.' end
+    for _, npc in ipairs(selected) do
+      local withinLimit, distanceError = npcOrderWithinLimit(npc, { marker })
+      if not withinLimit then return false, distanceError end
+    end
+    for _, npc in ipairs(selected) do
+      local ok, reason = startNpcOrder(session, npc, { marker }, { loop = false, speed = speed, waitSeconds = 0 })
+      if not ok then return false, reason end
+    end
+  elseif action == 'rts_move_point' then
+    local rawPosition = type(data.position) == 'table' and data.position or {}
+    local x = boundedNumber(rawPosition.x, -100000, 100000)
+    local y = boundedNumber(rawPosition.y, -100000, 100000)
+    local z = boundedNumber(rawPosition.z, -100000, 100000)
+    local speed = boundedNumber(data.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+    if not x or not y or not z or not speed then return false, 'The RTS map destination or movement pace is invalid.' end
+    local marker = { x = x, y = y, z = z, heading = 0 }
+    for _, npc in ipairs(selected) do
+      local withinLimit, distanceError = npcOrderWithinLimit(npc, { marker })
+      if not withinLimit then return false, distanceError end
+    end
+    for _, npc in ipairs(selected) do
+      local ok, reason = startNpcOrder(session, npc, { marker }, { loop = false, speed = speed, waitSeconds = 0 })
+      if not ok then return false, reason end
+    end
+  elseif action == 'rts_patrol' then
+    if not isDenseArray(data.markerIds, 20) or #data.markerIds < 2 then return false, 'A patrol needs at least two ordered waypoints.' end
+    local route, seenMarkers = {}, {}
+    for _, rawMarkerId in ipairs(data.markerIds) do
+      local markerId = positiveInteger(rawMarkerId)
+      local marker = markerId and encounterMarker(session, markerId, 'patrol') or nil
+      if not marker or seenMarkers[markerId] then return false, 'A patrol waypoint is missing or repeated.' end
+      seenMarkers[markerId] = true
+      route[#route + 1] = marker
+    end
+    local speed = boundedNumber(data.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+    local waitSeconds = boundedNumber(data.waitSeconds == nil and 3 or data.waitSeconds, 0, Config.Encounters.maxPatrolWaitSeconds)
+    if not speed or not waitSeconds then return false, 'Patrol pace or waypoint dwell time exceeds the configured limits.' end
+    for _, npc in ipairs(selected) do
+      local withinLimit, distanceError = npcOrderWithinLimit(npc, route)
+      if not withinLimit then return false, distanceError end
+    end
+    for _, npc in ipairs(selected) do
+      local ok, reason = startNpcOrder(session, npc, route, { loop = true, speed = speed, waitSeconds = waitSeconds })
+      if not ok then return false, reason end
+    end
+  elseif action == 'rts_stop' then
+    for _, npc in ipairs(selected) do stopNpcOrder(npc, false); npc.holdPosition = true end
+  elseif action == 'rts_stance' then
+    local stance = type(data.stance) == 'string' and data.stance or ''
+    if not rtsStances[stance] then return false, 'Choose Fire at Will, Return Fire, or Hold Fire.' end
+    for _, npc in ipairs(selected) do
+      local order = npc.order
+      npc.stance = stance
+      if stance == 'fire_at_will' then npc.holdPosition = false end
+      if order and order.kind == 'attack' and stance ~= 'fire_at_will' then
+        stopNpcOrder(npc, true)
+      elseif stance == 'fire_at_will' and npc.targetId then
+        local ok, reason = taskNpcCombat(npc, npc.targetId, false)
+        if not ok then return false, reason end
+      end
+    end
+  elseif action == 'rts_target' then
+    local targetId = positiveInteger(data.targetPlayerId)
+    if not targetId or not GetPlayerName(targetId) or not isAudienceMember(session, targetId) then
+      return false, 'Attack orders can target only connected members of the live session audience.'
+    end
+    for _, npc in ipairs(selected) do
+      npc.stance = 'fire_at_will'
+      local ok, reason = taskNpcCombat(npc, targetId, false)
+      if not ok then return false, reason end
+    end
+  elseif action == 'rts_weapon' then
+    local weapon = allowedEncounterWeapon(data.weapon)
+    if not weapon or type(data.enabled) ~= 'boolean' then return false, 'Choose a configured weapon and enabled/disabled state.' end
+    local native = data.enabled and GiveWeaponToPed or RemoveWeaponFromPed
+    if type(native) ~= 'function' then return false, 'RedM NPC weapon controls are unavailable on this server.' end
+    for _, npc in ipairs(selected) do
+      if type(npc.weaponStates) ~= 'table' or npc.weaponStates[weapon.name] == nil then
+        return false, 'That weapon is not configured for every selected NPC.'
+      end
+    end
+    for _, npc in ipairs(selected) do
+      local ok
+      if data.enabled then
+        ok = pcall(GiveWeaponToPed, npc.entity, GetHashKey(weapon.name), weapon.ammo, false, true)
+      else
+        ok = pcall(RemoveWeaponFromPed, npc.entity, GetHashKey(weapon.name))
+      end
+      if not ok then return false, 'RedM could not change the selected NPC weapon.' end
+      npc.weaponStates[weapon.name] = data.enabled
+      if not data.enabled and not npcHasEnabledWeapon(npc) and npc.order and npc.order.kind == 'attack' then
+        stopNpcOrder(npc, true)
+      elseif data.enabled and npc.stance == 'fire_at_will' and npc.targetId then
+        local applied, reason = taskNpcCombat(npc, npc.targetId, false)
+        if not applied then return false, reason end
+      end
+    end
+  end
+  return true
+end
+
+local function rtsSnapshotPayload(session)
+  local units, waypoints, players = {}, {}, {}
+  for _, npc in ipairs(sessionEncounterList(session, 'npc')) do
+    if encounterEntityExists(npc.entity) then
+      local ok, position = false, nil
+      if type(GetEntityCoords) == 'function' then ok, position = pcall(GetEntityCoords, npc.entity) end
+      if ok and position then
+        local weapons = {}
+        for name, enabled in pairs(npc.weaponStates or {}) do
+          local config = allowedEncounterWeapon(name)
+          weapons[#weapons + 1] = { name = name, label = config and config.label or name, enabled = enabled == true }
+        end
+        table.sort(weapons, function(a, b) return a.label < b.label end)
+        local order = npc.order or { kind = 'hold', status = 'holding' }
+        local health
+        if type(GetEntityHealth) == 'function' then local okHealth, result = pcall(GetEntityHealth, npc.entity); if okHealth then health = result end end
+        units[#units + 1] = {
+          id = npc.id, model = npc.model, x = position.x, y = position.y, z = position.z,
+          alive = not encounterEntityDead(npc.entity), health = health,
+          stance = npc.stance or 'fire_at_will', order = {
+          kind = order.kind, status = order.status, markerId = order.markerId, targetId = order.targetId,
+          targetCoords = order.targetCoords,
+            routeMarkerIds = order.route and (function()
+              local ids = {}
+              for _, marker in ipairs(order.route) do ids[#ids + 1] = tonumber(marker.id) end
+              return ids
+            end)() or nil,
+            routeIndex = order.routeIndex
+          },
+          weapons = weapons
+        }
+      end
+    end
+  end
+  for _, marker in pairs(session.spawnPoints or {}) do
+    if marker.kind == 'patrol' then
+      waypoints[#waypoints + 1] = { id = tonumber(marker.id), label = marker.label, x = tonumber(marker.x), y = tonumber(marker.y), z = tonumber(marker.z) }
+    end
+  end
+  table.sort(waypoints, function(a, b) return tostring(a.label) < tostring(b.label) end)
+  for _, id in ipairs(flowAudiencePlayers(session)) do
+    local position = currentPosition(id)
+    if position then players[#players + 1] = { id = id, name = GetPlayerName(id), x = position.x, y = position.y, z = position.z } end
+  end
+  return { storyId = session.storyId, units = units, waypoints = waypoints, players = players }
+end
+
+local function refreshRtsEngagements(session)
+  if not session or Config.Rts.enabled ~= true or Config.Encounters.enabled ~= true or Config.Rts.autoEngage ~= true then return end
+  if type(GetEntityCoords) ~= 'function' then return end
+  local range = boundedNumber(Config.Rts.autoEngageRange, 1, 1000) or 75
+  local now = GetGameTimer()
+  if now < (session.rtsEngagementNextAt or 0) then return end
+  session.rtsEngagementNextAt = now + math.max(250, tonumber(Config.Rts.autoEngageIntervalMs) or 1200)
+  local candidates = {}
+  for _, playerId in ipairs(flowAudiencePlayers(session)) do
+    local position = currentPosition(playerId)
+    if position then candidates[#candidates + 1] = { id = playerId, position = position } end
+  end
+  for _, npc in ipairs(sessionEncounterList(session, 'npc')) do
+    if npc.stance == 'fire_at_will' and not npc.holdPosition and encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) then
+      local ok, npcPosition = pcall(GetEntityCoords, npc.entity)
+      if ok and npcPosition then
+        local nearest, nearestDistance
+        for _, candidate in ipairs(candidates) do
+          local dx = npcPosition.x - candidate.position.x
+          local dy = npcPosition.y - candidate.position.y
+          local dz = npcPosition.z - candidate.position.z
+          local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+          if distance <= range and (not nearestDistance or distance < nearestDistance) then
+            nearest, nearestDistance = candidate.id, distance
+          end
+        end
+        local current = tonumber(npc.targetId)
+        local currentDistance
+        if current then
+          for _, candidate in ipairs(candidates) do
+            if candidate.id == current then
+              local dx = npcPosition.x - candidate.position.x
+              local dy = npcPosition.y - candidate.position.y
+              local dz = npcPosition.z - candidate.position.z
+              currentDistance = math.sqrt(dx * dx + dy * dy + dz * dz)
+              break
+            end
+          end
+        end
+        if npc.autoTarget and current and (not currentDistance or currentDistance > range) then
+          stopNpcOrder(npc, false)
+          current = nil
+        end
+        if not current and nearest and now >= (npc.autoEngageNextAt or 0) then
+          npc.autoEngageNextAt = now + 1500
+          taskNpcCombat(npc, nearest, false, true)
+        end
+      end
+    end
+  end
 end
 
 local function encounterDeathSatisfied(session, all)
@@ -1969,7 +2367,14 @@ local function snapshot()
       maxGroupCount = encounterConfig.maxGroupCount,
       maxNpcHealth = encounterConfig.maxNpcHealth,
       maxPatrolWaitSeconds = encounterConfig.maxPatrolWaitSeconds,
+      minPatrolSpeed = encounterConfig.minPatrolSpeed,
+      maxPatrolSpeed = encounterConfig.maxPatrolSpeed,
+      defaultPatrolSpeed = encounterConfig.defaultPatrolSpeed,
       models = encounterModels
+    },
+    rts = {
+      enabled = Config.Rts.enabled == true,
+      snapshotIntervalMs = Config.Rts.snapshotIntervalMs
     },
     effects = {
       enabled = effectsConfig.enabled == true,
@@ -2025,6 +2430,17 @@ RegisterNetEvent('arachnid_storyteller:requestSession', function()
   if Config.Session.broadcastToPlayers and activeSession and isAudienceMember(activeSession, source) then
     TriggerClientEvent('arachnid_storyteller:session', source, sessionPayload('sync'))
   end
+end)
+
+RegisterNetEvent('arachnid_storyteller:requestRtsSnapshot', function()
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  if Config.Rts.enabled ~= true or Config.Encounters.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.encounters) then return end
+  activeSession.rtsRequestAt = activeSession.rtsRequestAt or {}
+  local now = GetGameTimer()
+  if now - (activeSession.rtsRequestAt[src] or 0) < 500 then return end
+  activeSession.rtsRequestAt[src] = now
+  TriggerClientEvent('arachnid_storyteller:rtsSnapshot', src, rtsSnapshotPayload(activeSession))
 end)
 
 RegisterNetEvent('arachnid_storyteller:cameraPointCapture', function(rawSceneId, rawHeading, rawDistance)
@@ -2457,9 +2873,19 @@ RegisterNetEvent('arachnid_storyteller:sessionEncounterAction', function(raw)
     return feedback(src, 'Encounters are disabled or you lack the encounters ACE permission.')
   end
   local action = type(raw.action) == 'string' and raw.action or ''
+  local rtsActions = { rts_move = true, rts_move_point = true, rts_patrol = true, rts_stop = true, rts_stance = true, rts_target = true, rts_weapon = true }
+  if rtsActions[action] then
+    if Config.Rts.enabled ~= true then return feedback(src, 'The NPC RTS tool is disabled by the server owner.') end
+    local ok, actionOk, reason = pcall(applyRtsCommand, activeSession, action, raw)
+    if not ok or not actionOk then return feedback(src, 'RTS command failed: ' .. tostring(ok and reason or actionOk)) end
+    logAction(src, ('Issued NPC RTS order %s for story #%s'):format(action, tostring(activeSession.storyId)))
+    TriggerClientEvent('arachnid_storyteller:rtsSnapshot', src, rtsSnapshotPayload(activeSession))
+    feedback(src, 'NPC order issued.')
+    return
+  end
   local allowed = {
     spawn_npc = true, spawn_npc_group = true, remove_npc = true, make_npc_hostile = true,
-    set_npc_target = true, patrol_route = true, spawn_prop = true, delete_prop = true
+    set_npc_target = true, patrol_route = true, stop_patrol = true, spawn_prop = true, delete_prop = true
   }
   if not allowed[action] then return feedback(src, 'Choose a supported encounter action.') end
   local data = {}
@@ -2490,14 +2916,35 @@ RegisterNetEvent('arachnid_storyteller:sessionEncounterAction', function(raw)
       if not markerId or not encounterMarker(activeSession, markerId, 'patrol') then return feedback(src, 'A patrol waypoint does not belong to this story.') end
       data.markerIds[#data.markerIds + 1] = markerId
     end
-    data.waitSeconds = boundedNumber(raw.waitSeconds or 3, 1, Config.Encounters.maxPatrolWaitSeconds)
-    if not data.waitSeconds then return feedback(src, 'Patrol waypoint time exceeds the configured limit.') end
+    data.waitSeconds = boundedNumber(raw.waitSeconds == nil and 3 or raw.waitSeconds, 0, Config.Encounters.maxPatrolWaitSeconds)
+    data.speed = boundedNumber(raw.speed or Config.Encounters.defaultPatrolSpeed, Config.Encounters.minPatrolSpeed, Config.Encounters.maxPatrolSpeed)
+    if data.waitSeconds == nil or data.speed == nil then return feedback(src, 'Patrol pace or waypoint time exceeds the configured limits.') end
   end
   local ok, actionOk, reason = pcall(applyEncounterAction, activeSession, action, data)
   if not ok or not actionOk then return feedback(src, 'Encounter action failed: ' .. tostring(ok and reason or actionOk)) end
   logAction(src, ('Ran encounter action %s in story #%s'):format(action, tostring(activeSession.storyId)))
   flowTick()
   feedback(src, 'Encounter action completed.')
+end)
+
+AddEventHandler('weaponDamageEvent', function(sender, data)
+  local session = activeSession
+  local attacker = positiveInteger(sender)
+  if not session or not attacker or not isAudienceMember(session, attacker) or type(data) ~= 'table' or type(NetworkGetEntityFromNetworkId) ~= 'function' then return end
+  local netIds = type(data.hitGlobalIds) == 'table' and data.hitGlobalIds or { data.hitGlobalId }
+  for _, rawNetId in ipairs(netIds) do
+    local netId = positiveInteger(rawNetId)
+    if netId then
+      local okEntity, damagedEntity = pcall(NetworkGetEntityFromNetworkId, netId)
+      if okEntity and damagedEntity and damagedEntity ~= 0 then
+        for _, npc in ipairs(sessionEncounterList(session, 'npc')) do
+          if npc.entity == damagedEntity and npc.stance == 'return_fire' and not encounterEntityDead(npc.entity) then
+            taskNpcCombat(npc, attacker, true)
+          end
+        end
+      end
+    end
+  end
 end)
 
 RegisterNetEvent('arachnid_storyteller:sessionWorldAction', function(raw)
@@ -2705,6 +3152,11 @@ end)
 AddEventHandler('playerDropped', function()
   local leaving = tonumber(source)
   if leaving then frozenByArachnid[tostring(leaving)] = nil end
+  if leaving and activeSession then
+    for _, npc in ipairs(sessionEncounterList(activeSession, 'npc')) do
+      if tonumber(npc.targetId) == leaving then stopNpcOrder(npc, false) end
+    end
+  end
   if not activeSession or not activeSession.audience or activeSession.audience.mode == 'all' then return end
   for index = #activeSession.audience.participants, 1, -1 do
     if tonumber(activeSession.audience.participants[index]) == leaving then
@@ -2847,6 +3299,7 @@ CreateThread(function()
   while true do
     Wait(Config.Flow.tickMs)
     flowTick()
+    if activeSession then refreshRtsEngagements(activeSession) end
   end
 end)
 

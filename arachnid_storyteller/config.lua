@@ -126,10 +126,29 @@ Config.Encounters = {
   maxPropsPerSession = 64,
   maxGroupCount = 12,
   maxNpcHealth = 1000,
+  maxWeaponAmmo = 1000,
   maxPatrolWaitSeconds = 300,
+  minPatrolSpeed = 0.5,
+  maxPatrolSpeed = 3.0,
+  defaultPatrolSpeed = 1.0,
+  patrolArrivalRadius = 2.0,
+  patrolPathTimeoutSeconds = 180,
+  defaultStance = 'fire_at_will',
   spawnPointLabel = 100,
+  weapons = {},
   pedModels = {},
   propModels = {}
+}
+
+-- The tactical command view is a separate live-session tool. It only controls
+-- NPCs spawned and tracked by this resource, and requires the encounters ACE.
+Config.Rts = {
+  enabled = false,
+  snapshotIntervalMs = 1200,
+  maxOrderDistance = 1000,
+  autoEngage = true,
+  autoEngageRange = 75,
+  autoEngageIntervalMs = 1200
 }
 
 -- World targets are stable map references maintained by the server owner.

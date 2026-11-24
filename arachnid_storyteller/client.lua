@@ -192,6 +192,10 @@ RegisterNetEvent('arachnid_storyteller:sessionAdmin', function(payload)
   end
 end)
 
+RegisterNetEvent('arachnid_storyteller:rtsSnapshot', function(payload)
+  if opened and type(payload) == 'table' then SendNUIMessage({ action = 'rtsSnapshot', payload = payload }) end
+end)
+
 RegisterNetEvent('arachnid_storyteller:actionMessage', function(payload)
   if type(payload) == 'table' then SendNUIMessage({ action = 'actionMessage', payload = payload }) end
 end)
@@ -469,6 +473,11 @@ end)
 
 RegisterNUICallback('sessionEncounterAction', function(data, cb)
   if opened and type(data) == 'table' then TriggerServerEvent('arachnid_storyteller:sessionEncounterAction', data) end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('requestRtsSnapshot', function(_, cb)
+  if opened then TriggerServerEvent('arachnid_storyteller:requestRtsSnapshot') end
   cb({ ok = true })
 end)
 
