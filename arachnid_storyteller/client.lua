@@ -112,6 +112,20 @@ RegisterNUICallback('sessionStop', function(_, cb)
   cb({ ok = true })
 end)
 
+RegisterNUICallback('sessionObjectiveSave', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:sessionObjectiveSave', data.text)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('sessionObjectiveStatus', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:sessionObjectiveStatus', data.status)
+  end
+  cb({ ok = true })
+end)
+
 RegisterNUICallback('cameraPointCapture', function(data, cb)
   if opened and type(data) == 'table' then
     local ped = PlayerPedId()

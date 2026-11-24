@@ -10,6 +10,7 @@ Arachnid Storyteller is a standalone RedM gamemaster foundation. Its panel takes
 - Build ordered camera rails for a scene: capture nodes, set their placement distance, and edit FOV, hold, transition, notes, and order.
 - Start one live session from a published story, advance or jump between its beats, and end it explicitly.
 - Announce the active beat to connected players with a temporary narrative overlay.
+- Turn each scene's objective into a persistent player HUD item, then update, complete, or fail it from the gamemaster console.
 - Record all administration actions in MySQL.
 
 The session runtime deliberately announces story beats only. It does **not** spawn peds, control players, start cutscenes, or execute scenes. Those capabilities should be added as explicitly designed, permission-checked phases.
@@ -51,3 +52,4 @@ Camera rail playback is not enabled yet. This phase creates and validates the or
 - A story must be `published` and contain at least one scene beat before it can go live.
 - The server, not the NUI, decides which scene is active and broadcasts each change.
 - Set `Config.Session.broadcastToPlayers = false` to keep session controls active without showing the player overlay.
+- Advancing or jumping to another beat resets its live objective to that scene's saved objective; objective completion does not auto-advance the session.

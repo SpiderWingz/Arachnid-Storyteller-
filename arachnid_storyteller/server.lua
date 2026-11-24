@@ -1,6 +1,7 @@
 local databaseReady = false
 local activeSession = nil
 local statuses = { draft = true, published = true, archived = true }
+local objectiveStatuses = { active = true, completed = true, failed = true }
 
 MySQL.ready(function()
   local ok, err = pcall(function()
@@ -140,9 +141,23 @@ local function sessionPayload(mode)
       y = scene.y,
       z = scene.z
     } or nil,
+    objective = activeSession.objective,
     startedAt = activeSession.startedAt,
     startedBy = activeSession.startedBy
   }
+end
+
+local function activateSessionScene(index, actor)
+  activeSession.sceneIndex = index
+  local scene = activeSession.scenes[index]
+  local text = scene and tostring(scene.objective or '') or ''
+  activeSession.objective = {
+    text = text,
+    status = text ~= '' and 'active' or 'none',
+    updatedAt = os.time(),
+    updatedBy = actor
+  }
+  return scene
 end
 
 local function broadcastSession(mode)
@@ -345,6 +360,7 @@ RegisterNetEvent('arachnid_storyteller:sessionStart', function(rawStoryId)
     startedAt = os.time(),
     startedBy = actorName(src)
   }
+  activateSessionScene(1, actorName(src))
   logAction(src, ('Started live session for story #%s: %s'):format(tostring(story.id), story.title:sub(1, 80)))
   broadcastSession('started')
   feedback(src, 'Live session started at scene 1 of ' .. #story.scenes .. '.')
@@ -356,8 +372,7 @@ RegisterNetEvent('arachnid_storyteller:sessionNext', function()
   if activeSession.sceneIndex >= #activeSession.scenes then
     return feedback(src, 'The final scene beat is active. End the session when the story is complete.')
   end
-  activeSession.sceneIndex = activeSession.sceneIndex + 1
-  local scene = activeSession.scenes[activeSession.sceneIndex]
+  local scene = activateSessionScene(activeSession.sceneIndex + 1, actorName(src))
   logAction(src, ('Advanced live session #%s to scene #%s: %s'):format(
     tostring(activeSession.storyId), tostring(scene.id), scene.title:sub(1, 80)))
   broadcastSession('advanced')
@@ -374,8 +389,7 @@ RegisterNetEvent('arachnid_storyteller:sessionSelectScene', function(rawSceneId)
     if tonumber(scene.id) == sceneId then targetIndex = index break end
   end
   if not targetIndex then return feedback(src, 'That scene is not part of the active session.') end
-  activeSession.sceneIndex = targetIndex
-  local scene = activeSession.scenes[targetIndex]
+  local scene = activateSessionScene(targetIndex, actorName(src))
   logAction(src, ('Jumped live session #%s to scene #%s: %s'):format(
     tostring(activeSession.storyId), tostring(scene.id), scene.title:sub(1, 80)))
   broadcastSession('jumped')
@@ -390,6 +404,39 @@ RegisterNetEvent('arachnid_storyteller:sessionStop', function()
   logAction(src, ('Ended live session for story #%s: %s'):format(tostring(ended.storyId), ended.storyTitle:sub(1, 80)))
   broadcastSession('ended')
   feedback(src, 'Live session ended.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionObjectiveSave', function(rawText)
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  local text = cleanText(rawText or '', Config.Limits.activeObjective, false)
+  if text == nil then return feedback(src, 'Objective text is invalid.') end
+  activeSession.objective = {
+    text = text,
+    status = text ~= '' and 'active' or 'none',
+    updatedAt = os.time(),
+    updatedBy = actorName(src)
+  }
+  logAction(src, ('Updated live objective for story #%s'):format(tostring(activeSession.storyId)))
+  broadcastSession('objective_updated')
+  feedback(src, text == '' and 'Live objective cleared.' or 'Live objective updated.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionObjectiveStatus', function(rawStatus)
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  local status = type(rawStatus) == 'string' and rawStatus:lower() or nil
+  if not objectiveStatuses[status] then return feedback(src, 'Invalid objective status.') end
+  local objective = activeSession.objective
+  if not objective or tostring(objective.text or '') == '' then
+    return feedback(src, 'Set a live objective before changing its status.')
+  end
+  objective.status = status
+  objective.updatedAt = os.time()
+  objective.updatedBy = actorName(src)
+  logAction(src, ('Marked live objective %s for story #%s'):format(status, tostring(activeSession.storyId)))
+  broadcastSession('objective_' .. status)
+  feedback(src, 'Live objective marked ' .. status .. '.')
 end)
 
 RegisterNetEvent('arachnid_storyteller:storySave', function(raw)

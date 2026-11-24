@@ -51,3 +51,4 @@ Config.Camera.Tool = {
 
 Config.Limits.cameraLabel = 100
 Config.Limits.cameraMessage = 500
+Config.Limits.activeObjective = 1000
