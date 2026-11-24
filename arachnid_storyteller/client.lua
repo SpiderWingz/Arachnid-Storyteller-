@@ -44,6 +44,14 @@ RegisterNetEvent('arachnid_storyteller:session', function(payload)
   end
 end)
 
+RegisterNetEvent('arachnid_storyteller:sessionAdmin', function(payload)
+  if type(payload) == 'table' then SendNUIMessage({ action = 'sessionAdmin', payload = payload }) end
+end)
+
+RegisterNetEvent('arachnid_storyteller:actionMessage', function(payload)
+  if type(payload) == 'table' then SendNUIMessage({ action = 'actionMessage', payload = payload }) end
+end)
+
 RegisterNetEvent('arachnid_storyteller:denied', function(message)
   TriggerEvent('chat:addMessage', {
     args = { 'Arachnid Storyteller', message or 'You do not have permission to use /STTool.' }
@@ -168,6 +176,37 @@ RegisterNUICallback('areaDelete', function(data, cb)
   if opened and type(data) == 'table' then
     TriggerServerEvent('arachnid_storyteller:areaDelete', data.id)
   end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('flowSave', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:flowSave', data)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('teleportSave', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:teleportSave', data)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('teleportDelete', function(data, cb)
+  if opened and type(data) == 'table' then
+    TriggerServerEvent('arachnid_storyteller:teleportDelete', data.id, data.storyId)
+  end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('sessionPause', function(_, cb)
+  if opened then TriggerServerEvent('arachnid_storyteller:sessionPause') end
+  cb({ ok = true })
+end)
+
+RegisterNUICallback('sessionResume', function(_, cb)
+  if opened then TriggerServerEvent('arachnid_storyteller:sessionResume') end
   cb({ ok = true })
 end)
 

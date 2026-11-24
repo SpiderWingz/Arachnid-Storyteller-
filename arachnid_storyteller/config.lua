@@ -7,7 +7,8 @@ Config.Command = 'STTool'
 -- grant console visibility and story editing deliberately.
 Config.Ace = {
   open = 'arachnid.storyteller.open',
-  manage = 'arachnid.storyteller.manage'
+  manage = 'arachnid.storyteller.manage',
+  playerActions = 'arachnid.storyteller.playeractions'
 }
 
 Config.Limits = {
@@ -54,6 +55,7 @@ Config.Limits.cameraLabel = 100
 Config.Limits.cameraMessage = 500
 Config.Limits.activeObjective = 1000
 Config.Limits.areaLabel = 100
+Config.Limits.teleportLabel = 100
 
 Config.Areas = {
   minRadius = 1,
@@ -61,3 +63,47 @@ Config.Areas = {
   minDimension = 1,
   maxDimension = 1000
 }
+
+-- Server-side flow execution limits. Flows are snapshotted when a session starts.
+Config.Flow = {
+  maxNodes = 100,
+  maxLinks = 200,
+  maxStepsPerTick = 32,
+  tickMs = 500,
+  maxDelaySeconds = 3600,
+  maxVariableNumber = 1000000000
+}
+
+-- Player actions are opt-in except for narrative messages. Whitelists are
+-- intentionally empty so weapon and VORP job nodes cannot run by accident.
+Config.PlayerActions = {
+  enabled = {
+    sendMessage = true,
+    freeze = false,
+    unfreeze = false,
+    health = false,
+    armor = false,
+    giveWeapon = false,
+    removeWeapon = false,
+    stripAllWeapons = false,
+    teleport = false,
+    kill = false,
+    respawn = false,
+    changeJob = false
+  },
+  maxMessageLength = 1000,
+  maxHealth = 500,
+  maxArmor = 100,
+  maxAmmo = 1000,
+  teleportZOffset = 1.0,
+  weapons = {},
+  jobs = {}
+}
+
+-- Replace the empty allowlists above with entries like these:
+-- Config.PlayerActions.weapons = {
+--   WEAPON_REVOLVER_CATTLEMAN = { label = 'Cattleman Revolver', maxAmmo = 120, defaultAmmo = 6 }
+-- }
+-- Config.PlayerActions.jobs = {
+--   sheriff = { label = 'Sheriff', grades = { 0, 1, 2 } }
+-- }
