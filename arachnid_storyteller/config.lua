@@ -3,12 +3,16 @@ Config = {}
 -- Access the gamemaster console with /STTool.
 Config.Command = 'STTool'
 
--- Both ACE permissions are required. Keeping them separate lets server owners
--- grant console visibility and story editing deliberately.
+-- Console access is separate from the ACE permission for each optional feature
+-- family, so server owners can grant editing and world authority deliberately.
 Config.Ace = {
   open = 'arachnid.storyteller.open',
   manage = 'arachnid.storyteller.manage',
-  playerActions = 'arachnid.storyteller.playeractions'
+  playerActions = 'arachnid.storyteller.playeractions',
+  cutscenes = 'arachnid.storyteller.cutscenes',
+  encounters = 'arachnid.storyteller.encounters',
+  world = 'arachnid.storyteller.world',
+  effects = 'arachnid.storyteller.effects'
 }
 
 Config.Limits = {
@@ -19,8 +23,8 @@ Config.Limits = {
   sceneOrder = 10000
 }
 
--- A session is a single, server-authoritative live story. The initial runtime
--- broadcasts scene titles and objectives only; it does not control players.
+-- A session is a single, server-authoritative live story. Optional player,
+-- world, encounter, cutscene, and effect controls each have separate gates.
 Config.Session = {
   broadcastToPlayers = true,
   overlayDuration = 12000,
@@ -28,9 +32,8 @@ Config.Session = {
   maxParticipants = 64
 }
 
--- Camera rails are authored as ordered, persistent shot points. Playback and
--- interpolation deliberately remain a later phase; these settings define safe
--- capture defaults for the editor now.
+-- Camera rails are authored as ordered, persistent shot points and can be
+-- previewed or played as cutscenes for a session audience.
 Config.Camera = {
   captureHeight = 1.6,
   defaultFov = 75,
@@ -98,6 +101,56 @@ Config.PlayerActions = {
   teleportZOffset = 1.0,
   weapons = {},
   jobs = {}
+}
+
+Config.Cutscenes = {
+  enabled = false,
+  maxPoints = 100,
+  maxDuration = 1800,
+  minFov = 20,
+  maxFov = 120,
+  maxFadeSeconds = 30,
+  letterbox = true,
+  freezePlayers = false,
+  hideHud = false,
+  loop = false,
+  defaultFov = 75,
+  fadeIn = 0,
+  fadeOut = 0
+}
+
+Config.Encounters = {
+  enabled = false,
+  cleanupOnEnd = true,
+  maxNpcsPerSession = 32,
+  maxPropsPerSession = 64,
+  maxGroupCount = 12,
+  maxNpcHealth = 1000,
+  maxPatrolWaitSeconds = 300,
+  spawnPointLabel = 100,
+  pedModels = {},
+  propModels = {}
+}
+
+-- World targets are stable map references maintained by the server owner.
+-- Each entry must define a supported type, a position and its allowed actions.
+-- `restoreOnSessionEnd` selects whether Arachnid restores the observed prior
+-- state or keeps the requested final state when a story finishes.
+Config.World = {
+  enabled = false,
+  targets = {}
+}
+
+Config.Effects = {
+  enabled = false,
+  sounds = {},
+  maxDurationSeconds = 30,
+  maxVolume = 1.0,
+  minPitch = 50,
+  maxPitch = 150,
+  maxShakeAmplitude = 10,
+  maxShakeFrequency = 10,
+  maxMessageLength = 1000
 }
 
 -- Replace the empty allowlists above with entries like these:

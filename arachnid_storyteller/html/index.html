@@ -18,6 +18,8 @@
   <div id="story-beat"><small id="beat-story"></small><strong id="beat-title"></strong><p id="beat-objective"></p></div>
   <div id="story-objective"><small id="objective-status"></small><strong>Current objective</strong><p id="objective-text"></p></div>
   <div id="story-action-message"><small id="action-message-title"></small><p id="action-message-text"></p></div>
+  <div id="cutscene-overlay" style="display:none;position:absolute;left:50%;bottom:16%;transform:translateX(-50%);z-index:40;max-width:80vw;padding:10px 20px;text-align:center;color:#f4e7ce;background:#101717dd;border:1px solid #c49a59;border-radius:4px;pointer-events:none;white-space:pre-wrap"></div>
+  <div id="story-effect-overlay" style="display:none;position:absolute;left:50%;top:14%;transform:translateX(-50%);z-index:42;max-width:84vw;padding:15px 24px;text-align:center;color:#f4e7ce;background:#101717ed;border:1px solid #c49a59;border-radius:4px;box-shadow:0 10px 35px #0009;pointer-events:none;white-space:pre-wrap"></div>
   <script>
     const app=document.getElementById('app'),content=document.getElementById('content'),storyBeat=document.getElementById('story-beat'),beatStory=document.getElementById('beat-story'),beatTitle=document.getElementById('beat-title'),beatObjective=document.getElementById('beat-objective'),storyObjective=document.getElementById('story-objective'),objectiveStatus=document.getElementById('objective-status'),objectiveText=document.getElementById('objective-text'),storyActionMessage=document.getElementById('story-action-message'),actionMessageTitle=document.getElementById('action-message-title'),actionMessageText=document.getElementById('action-message-text');let state=null,feedback='',selectedStory=null,selectedScene=null,selectedCameraPoint=null,sessionAudienceMode='all',sessionParticipants=[],sessionAudienceAreaId=null,beatTimer=null,actionMessageTimer=null;
     function node(tag,text,cls){const element=document.createElement(tag);if(text!==undefined)element.textContent=String(text);if(cls)element.className=cls;return element}
@@ -101,5 +103,30 @@
   </script>
   <script src="areas.js"></script>
   <script src="flow.js"></script>
+  <script>
+    (() => {
+      const overlay = document.getElementById('cutscene-overlay');
+      const effect = document.getElementById('story-effect-overlay');
+      let effectTimer = null;
+      window.addEventListener('message', event => {
+        const data = event.data || {};
+        if (data.action === 'cutsceneOverlay' && overlay) {
+          overlay.textContent = String(data.message || '');
+          overlay.style.display = data.visible && overlay.textContent ? 'block' : 'none';
+        } else if (data.action === 'storyEffectMessage' && effect) {
+          clearTimeout(effectTimer);
+          effect.textContent = String(data.text || '');
+          effect.style.display = effect.textContent ? 'block' : 'none';
+          effect.style.top = data.kind === 'subtitle' ? 'auto' : '14%';
+          effect.style.bottom = data.kind === 'subtitle' ? '10%' : 'auto';
+          effectTimer = setTimeout(() => { effect.style.display = 'none'; }, Math.max(1, Math.min(30, Number(data.duration) || 5)) * 1000);
+        } else if (data.action === 'storyEffectCleanup' && effect) {
+          clearTimeout(effectTimer);
+          effect.style.display = 'none';
+          if (overlay) overlay.style.display = 'none';
+        }
+      });
+    })();
+  </script>
 </body>
 </html>

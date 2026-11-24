@@ -4,6 +4,10 @@ local statuses = { draft = true, published = true, archived = true }
 local objectiveStatuses = { active = true, completed = true, failed = true }
 local areaShapes = { sphere = true, box = true }
 local frozenByArachnid = {}
+local trackedEncounterEntities = {}
+local cleanupSessionEncounters
+local cleanupSessionWorld
+local cleanupSessionEffects
 
 MySQL.ready(function()
   local ok, err = pcall(function()
@@ -94,6 +98,26 @@ MySQL.ready(function()
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_arachnid_teleport_story (story_id,id)
     )]])
+    MySQL.query.await([[CREATE TABLE IF NOT EXISTS arachnid_storyteller_cutscene_settings (
+      scene_id BIGINT UNSIGNED PRIMARY KEY,
+      settings_json LONGTEXT NOT NULL,
+      updated_by VARCHAR(100) NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )]])
+    MySQL.query.await([[CREATE TABLE IF NOT EXISTS arachnid_storyteller_spawn_points (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      story_id BIGINT UNSIGNED NOT NULL,
+      label VARCHAR(100) NOT NULL,
+      kind VARCHAR(20) NOT NULL,
+      x DOUBLE NOT NULL,
+      y DOUBLE NOT NULL,
+      z DOUBLE NOT NULL,
+      heading DOUBLE NOT NULL DEFAULT 0,
+      created_by VARCHAR(100) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_arachnid_spawn_story (story_id,kind,id)
+    )]])
   end)
   databaseReady = ok
   if not ok then print('[arachnid_storyteller] Database setup failed: ' .. tostring(err)) end
@@ -122,6 +146,68 @@ local function boundedNumber(value, minimum, maximum)
   local number = tonumber(value)
   if not number or number ~= number or number < minimum or number > maximum then return nil end
   return number
+end
+
+local function defaultCutsceneSettings()
+  return {
+    freezePlayers = Config.Cutscenes.freezePlayers == true,
+    hideHud = Config.Cutscenes.hideHud == true,
+    letterbox = Config.Cutscenes.letterbox ~= false,
+    loop = Config.Cutscenes.loop == true,
+    fadeIn = tonumber(Config.Cutscenes.fadeIn) or 0,
+    fadeOut = tonumber(Config.Cutscenes.fadeOut) or 0,
+    defaultFov = tonumber(Config.Cutscenes.defaultFov) or 75
+  }
+end
+
+local function normalizedCutsceneSettings(raw)
+  local defaults = defaultCutsceneSettings()
+  raw = type(raw) == 'table' and raw or {}
+  local settings = {}
+  for _, key in ipairs({ 'freezePlayers', 'hideHud', 'letterbox', 'loop' }) do
+    if raw[key] ~= nil and type(raw[key]) ~= 'boolean' then return nil, 'Cutscene toggles must be true or false.' end
+    settings[key] = raw[key] == nil and defaults[key] or raw[key]
+  end
+  settings.fadeIn = boundedNumber(raw.fadeIn == nil and defaults.fadeIn or raw.fadeIn, 0, Config.Cutscenes.maxFadeSeconds)
+  settings.fadeOut = boundedNumber(raw.fadeOut == nil and defaults.fadeOut or raw.fadeOut, 0, Config.Cutscenes.maxFadeSeconds)
+  settings.defaultFov = boundedNumber(raw.defaultFov == nil and defaults.defaultFov or raw.defaultFov, Config.Cutscenes.minFov, Config.Cutscenes.maxFov)
+  if settings.fadeIn == nil or settings.fadeOut == nil or settings.defaultFov == nil then
+    return nil, 'Cutscene fade and FOV values exceed the server limits.'
+  end
+  return settings
+end
+
+local function sceneCutsceneSettings(sceneId)
+  local rows = MySQL.query.await('SELECT settings_json FROM arachnid_storyteller_cutscene_settings WHERE scene_id=? LIMIT 1', { sceneId }) or {}
+  if rows[1] then
+    local ok, decoded = pcall(json.decode, rows[1].settings_json)
+    if ok and type(decoded) == 'table' then return normalizedCutsceneSettings(decoded) end
+  end
+  return defaultCutsceneSettings()
+end
+
+local function cutscenePayload(scene, settings)
+  local points = scene.camera_points
+  if type(points) ~= 'table' then
+    points = MySQL.query.await([[SELECT id,label,message,sort_order,x,y,z,heading,fov,hold_duration,transition_duration
+      FROM arachnid_storyteller_camera_points WHERE scene_id=? ORDER BY sort_order ASC,id ASC]], { scene.id }) or {}
+  end
+  if #points < 1 or #points > Config.Cutscenes.maxPoints then return nil, 'This scene needs a valid camera rail before it can play.' end
+  local normalized, reason = normalizedCutsceneSettings(settings or scene.cutscene_settings)
+  if not normalized then return nil, reason end
+  local duration = 0
+  for _, point in ipairs(points) do
+    point.x, point.y, point.z = tonumber(point.x), tonumber(point.y), tonumber(point.z)
+    point.heading = tonumber(point.heading) or 0
+    point.fov = boundedNumber(point.fov, Config.Cutscenes.minFov, Config.Cutscenes.maxFov) or normalized.defaultFov
+    point.hold_duration = boundedNumber(point.hold_duration, 0, 300) or 0
+    point.transition_duration = boundedNumber(point.transition_duration, 0, 60) or 0
+    duration = duration + point.hold_duration
+    if point ~= points[#points] then duration = duration + point.transition_duration end
+  end
+  if duration <= 0 then duration = 0.1 end
+  if duration > Config.Cutscenes.maxDuration then return nil, 'This camera rail is longer than the configured cutscene limit.' end
+  return { sceneId = scene.id, title = scene.title, points = points, settings = normalized, duration = duration }
 end
 
 local function actorName(src)
@@ -201,7 +287,19 @@ end
 local flowNodeTypes = {
   start = true, scene = true, delay = true, branch = true, random_branch = true,
   set_variable = true, add_variable = true, subtract_variable = true, objective = true,
-  wait_objective = true, wait_area = true, ['end'] = true,
+  complete_objective = true, fail_objective = true, wait_objective = true,
+  wait_area = true, wait_all_in_area = true, wait_area_empty = true,
+  check_player_count = true, check_job = true, check_entity_alive = true,
+  and_node = true, or_node = true, not_node = true,
+  play_cutscene = true, wait_cutscene = true, stop_cutscene = true,
+  spawn_npc = true, spawn_npc_group = true, remove_npc = true,
+  wait_npc_death = true, wait_npcs_dead = true, make_npc_hostile = true,
+  set_npc_target = true, patrol_route = true, spawn_prop = true, delete_prop = true,
+  door_open = true, door_close = true, door_lock = true, door_unlock = true,
+  entity_enable = true, entity_disable = true, trigger_entity = true,
+  play_sound = true, stop_sound = true, screen_fade = true,
+  announcement = true, subtitle = true, screen_shake = true,
+  ['end'] = true,
   send_message = true, freeze_players = true, unfreeze_players = true, set_health = true,
   set_armor = true, give_weapon = true, strip_weapon = true, strip_all_weapons = true,
   teleport_players = true, kill_players = true, respawn_players = true, change_job = true
@@ -211,7 +309,20 @@ local flowOutputs = {
   branch = { ['true'] = true, ['false'] = true }, random_branch = { success = true, failure = true },
   set_variable = { next = true }, add_variable = { next = true }, subtract_variable = { next = true },
   objective = { next = true }, wait_objective = { completed = true, failed = true },
-  wait_area = { next = true }, ['end'] = {},
+  complete_objective = { next = true }, fail_objective = { next = true },
+  wait_area = { next = true }, wait_all_in_area = { next = true }, wait_area_empty = { next = true },
+  check_player_count = { ['true'] = true, ['false'] = true }, check_job = { ['true'] = true, ['false'] = true },
+  check_entity_alive = { ['true'] = true, ['false'] = true },
+  and_node = { next = true }, or_node = { next = true }, not_node = { next = true },
+  play_cutscene = { next = true }, wait_cutscene = { next = true }, stop_cutscene = { next = true },
+  spawn_npc = { next = true }, spawn_npc_group = { next = true }, remove_npc = { next = true },
+  wait_npc_death = { next = true }, wait_npcs_dead = { next = true }, make_npc_hostile = { next = true },
+  set_npc_target = { next = true }, patrol_route = { next = true }, spawn_prop = { next = true }, delete_prop = { next = true },
+  door_open = { next = true }, door_close = { next = true }, door_lock = { next = true }, door_unlock = { next = true },
+  entity_enable = { next = true }, entity_disable = { next = true }, trigger_entity = { next = true },
+  play_sound = { next = true }, stop_sound = { next = true }, screen_fade = { next = true },
+  announcement = { next = true }, subtitle = { next = true }, screen_shake = { next = true },
+  ['end'] = {},
   send_message = { next = true }, freeze_players = { next = true }, unfreeze_players = { next = true },
   set_health = { next = true }, set_armor = { next = true }, give_weapon = { next = true },
   strip_weapon = { next = true }, strip_all_weapons = { next = true }, teleport_players = { next = true },
@@ -225,6 +336,23 @@ local flowActionSettings = {
   respawn_players = 'respawn', change_job = 'changeJob'
 }
 local flowVorpActions = { respawn_players = true, change_job = true }
+local flowFeatureNodes = {
+  cutscenes = { play_cutscene = true, wait_cutscene = true, stop_cutscene = true },
+  encounters = {
+    spawn_npc = true, spawn_npc_group = true, remove_npc = true, wait_npc_death = true,
+    wait_npcs_dead = true, make_npc_hostile = true, set_npc_target = true, patrol_route = true,
+    spawn_prop = true, delete_prop = true
+  },
+  world = { check_entity_alive = true, door_open = true, door_close = true, door_lock = true, door_unlock = true, entity_enable = true, entity_disable = true, trigger_entity = true },
+  effects = { play_sound = true, stop_sound = true, screen_fade = true, announcement = true, subtitle = true, screen_shake = true }
+}
+local flowInputPorts = { and_node = { a = true, b = true }, or_node = { a = true, b = true } }
+local flowWorldActions = {
+  door_open = 'open', door_close = 'close', door_lock = 'lock', door_unlock = 'unlock',
+  entity_enable = 'enable', entity_disable = 'disable', trigger_entity = 'trigger'
+}
+local configuredWorldTarget
+local applyWorldAction
 
 local function getVorpCore()
   if GetResourceState('vorp_core') ~= 'started' then return nil, 'vorp_core is not started.' end
@@ -288,6 +416,62 @@ local function allowedJob(name, grade)
   return entry
 end
 
+local function allowedEncounterModel(kind, model)
+  local config = Config.Encounters or {}
+  local list = kind == 'ped' and config.pedModels or config.propModels
+  local entry = type(list) == 'table' and type(model) == 'string' and list[model] or nil
+  if entry == true then entry = {} end
+  if type(entry) ~= 'table' or #model < 1 or #model > 100 then return nil end
+  return entry
+end
+
+local function maxPedHealth(entry)
+  local configured = type(entry) == 'table' and tonumber(entry.maxHealth) or nil
+  local serverLimit = tonumber(Config.Encounters.maxNpcHealth) or 1000
+  if not configured then return serverLimit end
+  return math.max(1, math.min(serverLimit, configured))
+end
+
+local function allowedEffectSound(soundId)
+  local sounds = type(Config.Effects.sounds) == 'table' and Config.Effects.sounds or {}
+  local entry = type(soundId) == 'string' and sounds[soundId] or nil
+  if type(entry) ~= 'table' or type(entry.name) ~= 'string' or type(entry.set) ~= 'string' then return nil end
+  if not entry.name:match('^[%w_%-]+$') or not entry.set:match('^[%w_%-]+$') then return nil end
+  return entry
+end
+
+local function normalizeEffectData(kind, raw)
+  raw = type(raw) == 'table' and raw or {}
+  local data = {}
+  if kind == 'play_sound' or kind == 'stop_sound' then
+    local soundId = type(raw.soundId) == 'string' and raw.soundId or ''
+    if not allowedEffectSound(soundId) then return nil, 'Choose an owner-allowlisted sound.' end
+    data.soundId = soundId
+    if kind == 'play_sound' then
+      data.volume = boundedNumber(raw.volume == nil and 1 or raw.volume, 0, Config.Effects.maxVolume)
+      data.pitch = boundedNumber(raw.pitch == nil and 100 or raw.pitch, Config.Effects.minPitch, Config.Effects.maxPitch)
+      if data.volume == nil or data.pitch == nil then return nil, 'Sound volume or pitch exceeds the configured limits.' end
+    end
+  elseif kind == 'screen_fade' then
+    local direction = raw.direction == 'out' and 'out' or raw.direction == 'in' and 'in' or nil
+    data.duration = boundedNumber(raw.duration == nil and 1 or raw.duration, 0, Config.Effects.maxDurationSeconds)
+    if not direction or data.duration == nil then return nil, 'Screen fade direction or duration is invalid.' end
+    data.direction = direction
+  elseif kind == 'announcement' or kind == 'subtitle' then
+    data.text = cleanText(raw.text or '', Config.Effects.maxMessageLength, true)
+    data.duration = boundedNumber(raw.duration == nil and 5 or raw.duration, 1, Config.Effects.maxDurationSeconds)
+    if not data.text or data.duration == nil then return nil, 'Effect text or duration is invalid.' end
+  elseif kind == 'screen_shake' then
+    data.amplitude = boundedNumber(raw.amplitude == nil and 1 or raw.amplitude, 0, Config.Effects.maxShakeAmplitude)
+    data.frequency = boundedNumber(raw.frequency == nil and 1 or raw.frequency, 0, Config.Effects.maxShakeFrequency)
+    data.duration = boundedNumber(raw.duration == nil and 2 or raw.duration, 1, Config.Effects.maxDurationSeconds)
+    if data.amplitude == nil or data.frequency == nil or data.duration == nil then return nil, 'Screen shake values exceed the configured limits.' end
+  else
+    return nil, 'Unknown effect action.'
+  end
+  return data
+end
+
 local function validateFlowGraph(rawGraph, storyId, requireRunnable)
   if type(rawGraph) ~= 'table' or not isDenseArray(rawGraph.nodes, Config.Flow.maxNodes) or not isDenseArray(rawGraph.links, Config.Flow.maxLinks) then
     return nil, 'Flow graph must contain node and link lists.'
@@ -304,9 +488,28 @@ local function validateFlowGraph(rawGraph, storyId, requireRunnable)
   local teleportRows = MySQL.query.await([[SELECT id,story_id,label,x,y,z,heading FROM arachnid_storyteller_teleports WHERE story_id=?]], { storyId }) or {}
   local teleportById = {}
   for _, marker in ipairs(teleportRows) do teleportById[tostring(marker.id)] = marker end
+  local railRows = MySQL.query.await([[SELECT scene_id,id,label,message,sort_order,x,y,z,heading,fov,hold_duration,transition_duration
+    FROM arachnid_storyteller_camera_points WHERE scene_id IN
+      (SELECT id FROM arachnid_storyteller_scenes WHERE story_id=?) ORDER BY scene_id,sort_order,id]], { storyId }) or {}
+  local cutscenePoints = {}
+  for _, point in ipairs(railRows) do
+    cutscenePoints[tostring(point.scene_id)] = cutscenePoints[tostring(point.scene_id)] or {}
+    cutscenePoints[tostring(point.scene_id)][#cutscenePoints[tostring(point.scene_id)] + 1] = point
+  end
+  local cutsceneRows = MySQL.query.await([[SELECT settings.scene_id,settings.settings_json FROM arachnid_storyteller_cutscene_settings AS settings
+    INNER JOIN arachnid_storyteller_scenes AS scenes ON scenes.id=settings.scene_id WHERE scenes.story_id=?]], { storyId }) or {}
+  local cutsceneSettings = {}
+  for _, row in ipairs(cutsceneRows) do
+    local ok, decoded = pcall(json.decode, row.settings_json)
+    if ok and type(decoded) == 'table' then cutsceneSettings[tostring(row.scene_id)] = normalizedCutsceneSettings(decoded) end
+  end
+  local spawnRows = MySQL.query.await([[SELECT id,story_id,label,kind,x,y,z,heading FROM arachnid_storyteller_spawn_points WHERE story_id=?]], { storyId }) or {}
+  local spawnById = {}
+  for _, point in ipairs(spawnRows) do spawnById[tostring(point.id)] = point end
 
   local graph = { nodes = {}, links = {} }
-  local nodes, starts, ends, hasPlayerActions, hasVorpActions, hasRespawn, hasChangeJob = {}, 0, 0, false, false, false, false
+  local nodes, starts, ends, hasPlayerActions, hasVorpActions, hasRespawn, hasChangeJob, hasVorpChecks = {}, 0, 0, false, false, false, false, false
+  local featureFamilies = { cutscenes = false, encounters = false, world = false, effects = false }
   for _, rawNode in ipairs(rawGraph.nodes) do
     if type(rawNode) ~= 'table' or type(rawNode.id) ~= 'string' or #rawNode.id < 1 or #rawNode.id > 64 or
       not flowNodeTypes[rawNode.type] or nodes[rawNode.id] then
@@ -350,10 +553,101 @@ local function validateFlowGraph(rawGraph, storyId, requireRunnable)
       local text = cleanText(rawData.text or '', Config.Limits.activeObjective, true)
       if not text then return nil, 'Objective nodes need objective text.' end
       data.text = text
-    elseif kind == 'wait_area' then
+    elseif kind == 'wait_area' or kind == 'wait_all_in_area' or kind == 'wait_area_empty' then
       local areaId = positiveInteger(rawData.areaId)
       if not areaId or not areaById[tostring(areaId)] then return nil, 'An area wait references a missing saved area.' end
       data.areaId = areaId
+    elseif kind == 'check_player_count' then
+      local operator = rawData.operator
+      local count = boundedNumber(rawData.count, 0, Config.Session.maxParticipants)
+      if not flowOperators[operator] or count == nil or count % 1 ~= 0 then return nil, 'Player count checks need a supported operator and whole number.' end
+      data.operator, data.count = operator == '~=' and '!=' or operator, count
+    elseif kind == 'check_job' then
+      if type(rawData.jobName) ~= 'string' or #rawData.jobName < 1 or #rawData.jobName > 64 then return nil, 'Choose an allowlisted VORP job to check.' end
+      local jobs = type(Config.PlayerActions.jobs) == 'table' and Config.PlayerActions.jobs or {}
+      if requireRunnable and type(jobs[rawData.jobName]) ~= 'table' then return nil, 'That job is not in the server allowlist.' end
+      data.jobName = rawData.jobName
+      hasVorpChecks = true
+    elseif kind == 'check_entity_alive' then
+      local targetId = type(rawData.targetId) == 'string' and rawData.targetId or ''
+      if #targetId < 1 or #targetId > 64 or type(Config.World.targets) ~= 'table' or type(Config.World.targets[targetId]) ~= 'table' then
+        return nil, 'Choose a registered world target for the entity check.'
+      end
+      data.targetId = targetId
+    elseif flowWorldActions[kind] then
+      local targetId = type(rawData.targetId) == 'string' and rawData.targetId or ''
+      local target = configuredWorldTarget(targetId)
+      local action = flowWorldActions[kind]
+      if #targetId < 1 or #targetId > 64 or type(target) ~= 'table' or type(target.actions) ~= 'table' or target.actions[action] ~= true then
+        return nil, 'Choose a registered world target with this action explicitly enabled.'
+      end
+      if type(target.restoreOnSessionEnd) ~= 'boolean' then return nil, 'Each registered world target needs a restoreOnSessionEnd true/false policy.' end
+      if (action == 'open' or action == 'close' or action == 'lock' or action == 'unlock') and target.kind ~= 'door' then
+        return nil, 'Door operations require a target configured with kind = door.'
+      end
+      if (action == 'enable' or action == 'disable') and target.kind ~= 'entity' then
+        return nil, 'Enable/disable operations require a target configured with kind = entity.'
+      end
+      if action == 'trigger' and (type(target.triggerEvent) ~= 'string' or target.triggerEvent == '' or target.restoreOnSessionEnd) then
+        return nil, 'Trigger targets need an owner-configured event and a persistent target policy.'
+      end
+      data.targetId = targetId
+      if requireRunnable and target.kind == 'door' and (type(DoorSystemGetDoorState) ~= 'function' or type(DoorSystemGetOpenRatio) ~= 'function' or type(DoorSystemSetDoorState) ~= 'function' or type(DoorSystemSetOpenRatio) ~= 'function') then
+        return nil, 'RedM door-system state controls are unavailable on this server.'
+      end
+    elseif kind == 'play_cutscene' then
+      local sceneId = positiveInteger(rawData.sceneId)
+      if not sceneId or not sceneIds[tostring(sceneId)] then return nil, 'A cutscene node references a missing scene in this story.' end
+      if #(cutscenePoints[tostring(sceneId)] or {}) < 1 then return nil, 'A cutscene node requires a scene with a saved camera rail.' end
+      if #cutscenePoints[tostring(sceneId)] > Config.Cutscenes.maxPoints then return nil, 'The scene camera rail exceeds the configured cutscene point limit.' end
+      data.sceneId = sceneId
+    elseif flowFeatureNodes.cutscenes[kind] then
+      -- Wait and Stop use only their execution ports.
+    elseif kind == 'spawn_npc' or kind == 'spawn_npc_group' then
+      local model = type(rawData.model) == 'string' and rawData.model or ''
+      local markerId = positiveInteger(rawData.spawnPointId)
+      local marker = markerId and spawnById[tostring(markerId)] or nil
+      local modelEntry = allowedEncounterModel('ped', model)
+      local health = boundedNumber(rawData.health or 150, 1, maxPedHealth(modelEntry))
+      if not modelEntry or not marker or marker.kind ~= 'npc' or health == nil or health % 1 ~= 0 then
+        return nil, 'NPC nodes need an allowlisted model, valid NPC spawn marker, and whole-number health within the server limit.'
+      end
+      data.model, data.spawnPointId, data.health = model, markerId, health
+      if kind == 'spawn_npc_group' then
+        local count = boundedNumber(rawData.count, 1, Config.Encounters.maxGroupCount)
+        if count == nil or count % 1 ~= 0 then return nil, 'NPC group count exceeds the configured limit.' end
+        data.count = count
+      end
+      if requireRunnable and type(CreatePed) ~= 'function' then return nil, 'Server ped creation is unavailable; verify OneSync and RedM entity support.' end
+    elseif kind == 'spawn_prop' then
+      local model = type(rawData.model) == 'string' and rawData.model or ''
+      local markerId = positiveInteger(rawData.spawnPointId)
+      local marker = markerId and spawnById[tostring(markerId)] or nil
+      if not allowedEncounterModel('prop', model) or not marker or marker.kind ~= 'prop' then
+        return nil, 'Prop nodes need an allowlisted model and a valid prop spawn marker.'
+      end
+      data.model, data.spawnPointId = model, markerId
+      if requireRunnable and type(CreateObjectNoOffset) ~= 'function' then return nil, 'Server object creation is unavailable; verify OneSync and RedM entity support.' end
+    elseif kind == 'set_npc_target' then
+      local target = rawData.target == nil and 'random' or rawData.target
+      if target ~= 'all' and target ~= 'random' then return nil, 'NPC target mode must be all or random.' end
+      data.target = target
+    elseif kind == 'patrol_route' then
+      if not isDenseArray(rawData.markerIds, 20) or #rawData.markerIds < 2 then return nil, 'A patrol route needs at least two saved waypoint markers.' end
+      local route = {}
+      for _, rawMarkerId in ipairs(rawData.markerIds) do
+        local markerId = positiveInteger(rawMarkerId)
+        local marker = markerId and spawnById[tostring(markerId)] or nil
+        if not marker or marker.kind ~= 'patrol' then return nil, 'A patrol route references a missing waypoint marker.' end
+        route[#route + 1] = markerId
+      end
+      data.markerIds = route
+    elseif flowFeatureNodes.effects[kind] then
+      local normalized, reason = normalizeEffectData(kind, rawData)
+      if not normalized then return nil, reason end
+      data = normalized
+    elseif flowFeatureNodes.encounters[kind] then
+      -- Remove, wait, and hostility nodes do not need additional settings.
     elseif flowActionSettings[kind] then
       hasPlayerActions = true
       if flowVorpActions[kind] then hasVorpActions = true end
@@ -402,6 +696,15 @@ local function validateFlowGraph(rawGraph, storyId, requireRunnable)
         data.jobName, data.grade = rawData.jobName, grade
       end
     end
+    for family, nodeSet in pairs(flowFeatureNodes) do
+      if nodeSet[kind] then
+        featureFamilies[family] = true
+        local familyConfig = Config[family == 'cutscenes' and 'Cutscenes' or family == 'encounters' and 'Encounters' or family == 'world' and 'World' or 'Effects']
+        if requireRunnable and (not familyConfig or familyConfig.enabled ~= true) then
+          return nil, ('The %s feature family is disabled by the server owner.'):format(family)
+        end
+      end
+    end
     local node = { id = rawNode.id, type = kind, x = x, y = y, data = data }
     nodes[node.id] = node
     graph.nodes[#graph.nodes + 1] = node
@@ -417,14 +720,18 @@ local function validateFlowGraph(rawGraph, storyId, requireRunnable)
     end
     linkIds[rawLink.id] = true
     local from, to = nodes[rawLink.fromNode], nodes[rawLink.toNode]
-    if not from or not to or from.type == 'end' or rawLink.toSocket ~= 'in' or to.type == 'start' or
+    local inputAllowed = to and ((flowInputPorts[to.type] and flowInputPorts[to.type][rawLink.toSocket]) or
+      (not flowInputPorts[to.type] and rawLink.toSocket == 'in'))
+    if not from or not to or from.type == 'end' or not inputAllowed or to.type == 'start' or
       not flowOutputs[from.type][rawLink.fromSocket] then
       return nil, 'A flow connection uses a missing node or invalid port.'
     end
     local outputKey = rawLink.fromNode .. ':' .. rawLink.fromSocket
-    if outgoing[outputKey] or incoming[rawLink.toNode] then return nil, 'Each output and input port can have only one connection.' end
-    outgoing[outputKey] = rawLink.toNode
-    incoming[rawLink.toNode] = true
+    local inputKey = rawLink.toNode .. ':' .. rawLink.toSocket
+    if incoming[inputKey] then return nil, 'Each input port can have only one connection.' end
+    outgoing[outputKey] = outgoing[outputKey] or {}
+    outgoing[outputKey][#outgoing[outputKey] + 1] = { nodeId = rawLink.toNode, inputPort = rawLink.toSocket }
+    incoming[inputKey] = true
     adjacency[rawLink.fromNode] = adjacency[rawLink.fromNode] or {}
     adjacency[rawLink.fromNode][#adjacency[rawLink.fromNode] + 1] = rawLink.toNode
     graph.links[#graph.links + 1] = {
@@ -445,11 +752,11 @@ local function validateFlowGraph(rawGraph, storyId, requireRunnable)
   if requireRunnable then
     if #graph.nodes == 0 then return nil, 'This story has no flow graph.' end
     if starts ~= 1 then return nil, 'A flow must have exactly one Start node.' end
-    if hasVorpActions then
+    if hasVorpActions or hasVorpChecks then
       local core, coreError = getVorpCore()
       if not core then return nil, coreError end
       if (hasRespawn and (type(core.Player) ~= 'table' or type(core.Player.Respawn) ~= 'function')) or
-        (hasChangeJob and type(core.getUser) ~= 'function') then
+        ((hasChangeJob or hasVorpChecks) and type(core.getUser) ~= 'function') then
         return nil, 'The required VORP Player API is unavailable.'
       end
     end
@@ -468,12 +775,22 @@ local function validateFlowGraph(rawGraph, storyId, requireRunnable)
       for port in pairs(flowOutputs[node.type]) do
         if not outgoing[id .. ':' .. port] then return nil, ('Connect the %s output on node %s.'):format(port, id) end
       end
-      if node.type ~= 'start' and not incoming[id] then return nil, ('Connect an input to node %s.'):format(id) end
+      if node.type ~= 'start' then
+        if flowInputPorts[node.type] then
+          for port in pairs(flowInputPorts[node.type]) do
+            if not incoming[id .. ':' .. port] then return nil, ('Connect the %s input on node %s.'):format(port, id) end
+          end
+        elseif not incoming[id .. ':in'] then
+          return nil, ('Connect an input to node %s.'):format(id)
+        end
+      end
     end
   end
   return graph, nil, {
     nodes = nodes, outgoing = outgoing, areas = areaById, teleports = teleportById,
-    hasPlayerActions = hasPlayerActions, hasVorpActions = hasVorpActions
+    hasPlayerActions = hasPlayerActions, hasVorpActions = hasVorpActions,
+    hasVorpChecks = hasVorpChecks, featureFamilies = featureFamilies,
+    cutscenePoints = cutscenePoints, cutsceneSettings = cutsceneSettings, spawnPoints = spawnById
   }
 end
 
@@ -550,17 +867,26 @@ local function sessionPayload(mode, session)
       z = scene.z
     } or nil,
     objective = current.objective,
+    encounters = {
+      npcs = current.entities and #(current.entities.npcs or {}) or 0,
+      props = current.entities and #(current.entities.props or {}) or 0
+    },
     audience = {
       mode = current.audience and current.audience.mode or 'all',
       count = current.audience and current.audience.mode ~= 'all' and #(current.audience.participants or {}) or #GetPlayers(),
       areaLabel = current.audience and current.audience.areaLabel or nil
     },
+    cutscene = current.cutscene and {
+      sceneId = current.cutscene.sceneId,
+      paused = current.cutscene.paused == true
+    } or nil,
     startedAt = current.startedAt,
     startedBy = current.startedBy,
     flow = current.flowRuntime and {
-      state = current.flowRuntime.paused and 'paused' or 'running',
-      waiting = current.flowRuntime.waiting and current.flowRuntime.waiting.kind or nil,
-      nodeId = current.flowRuntime.waiting and current.flowRuntime.waiting.nodeId or current.flowRuntime.currentNode,
+      state = current.flowRuntime.paused and 'paused' or #current.flowRuntime.queue == 0 and #current.flowRuntime.waiters > 0 and 'waiting' or 'running',
+      waiting = current.flowRuntime.waiters[1] and current.flowRuntime.waiters[1].kind or nil,
+      nodeId = current.flowRuntime.queue[1] and current.flowRuntime.queue[1].nodeId or
+        current.flowRuntime.waiters[1] and current.flowRuntime.waiters[1].nodeId or nil,
       error = current.flowRuntime.error
     } or nil
   }
@@ -612,19 +938,41 @@ local function cleanupOwnedFreezes(runtimeId)
   end
 end
 
+local function stopSessionCutscene(session)
+  if not session or not session.cutscene then return end
+  local targets = {}
+  if session.audience and session.audience.mode ~= 'all' then
+    for _, id in ipairs(session.audience.participants or {}) do
+      if GetPlayerName(id) then targets[#targets + 1] = tonumber(id) end
+    end
+  else
+    for _, player in ipairs(onlinePlayers()) do targets[#targets + 1] = player.id end
+  end
+  for _, id in ipairs(targets) do TriggerClientEvent('arachnid_storyteller:cutsceneStop', id) end
+  session.cutscene = nil
+end
+
 local function endActiveSession(mode, actor)
   if not activeSession then return end
   local ended = activeSession
   activeSession = nil
+  stopSessionCutscene(ended)
+  cleanupSessionEncounters(ended, false)
+  cleanupSessionWorld(ended)
+  cleanupSessionEffects(ended)
   cleanupOwnedFreezes(ended.runtimeId)
   if actor then logAction(actor, ('Ended live session for story #%s: %s'):format(tostring(ended.storyId), ended.storyTitle:sub(1, 80))) end
   broadcastSession(mode or 'ended', ended)
 end
 
 local function flowRoute(runtime, nodeId, port)
-  local destination = runtime.outgoing[nodeId .. ':' .. port]
-  if not destination then return nil end
-  return destination
+  return runtime.outgoing[nodeId .. ':' .. port] or {}
+end
+
+local function flowEnqueueRoute(runtime, nodeId, port)
+  for _, destination in ipairs(flowRoute(runtime, nodeId, port)) do
+    runtime.queue[#runtime.queue + 1] = { nodeId = destination.nodeId, inputPort = destination.inputPort }
+  end
 end
 
 local function flowAudiencePlayers(session)
@@ -646,6 +994,390 @@ local function flowAreaSatisfied(session, area)
   return false
 end
 
+local vorpCharacterFor
+
+local function flowAreaCondition(session, area, condition)
+  local players, inside = flowAudiencePlayers(session), 0
+  for _, id in ipairs(players) do
+    if areaContains(area, currentPosition(id)) then inside = inside + 1 end
+  end
+  if condition == 'any' then return inside > 0 end
+  if condition == 'all' then return #players > 0 and inside == #players end
+  if condition == 'empty' then return inside == 0 end
+  return false
+end
+
+local function flowCountMatches(value, operator, expected)
+  if operator == '==' then return value == expected end
+  if operator == '!=' then return value ~= expected end
+  if operator == '>' then return value > expected end
+  if operator == '<' then return value < expected end
+  if operator == '>=' then return value >= expected end
+  if operator == '<=' then return value <= expected end
+  return false
+end
+
+local function flowAudienceHasJob(session, jobName)
+  local core = getVorpCore()
+  if not core then return false end
+  for _, id in ipairs(flowAudiencePlayers(session)) do
+    local character = vorpCharacterFor(id, core)
+    local job = character and (character.job or character.jobName or character.Job)
+    if type(job) == 'table' then job = job.name or job.id end
+    if type(job) == 'string' and job:lower() == tostring(jobName):lower() then return true end
+  end
+  return false
+end
+
+local function flowConfiguredEntityAlive(targetId)
+  local target = type(Config.World.targets) == 'table' and Config.World.targets[targetId] or nil
+  if type(target) ~= 'table' or type(target.coords) ~= 'table' then return false end
+  local coords = target.coords
+  local x, y, z = tonumber(coords.x), tonumber(coords.y), tonumber(coords.z)
+  if not x or not y or not z then return false end
+  local radius = boundedNumber(target.radius, 0.5, 100) or 5
+  local model = target.model
+  if type(model) == 'string' then model = GetHashKey(model) end
+  if type(model) ~= 'number' then return false end
+  local entity = 0
+  if target.kind == 'ped' and type(GetClosestPed) == 'function' then
+    local ok, result = pcall(GetClosestPed, x, y, z, radius, true, true, true, true, -1, model)
+    if ok then entity = result end
+  elseif type(GetClosestObjectOfType) == 'function' then
+    local ok, result = pcall(GetClosestObjectOfType, x, y, z, radius, model, false, false, false)
+    if ok then entity = result end
+  end
+  return entity and entity ~= 0 and type(DoesEntityExist) == 'function' and DoesEntityExist(entity)
+    and (type(IsEntityDead) ~= 'function' or not IsEntityDead(entity))
+end
+
+local function encounterEntityExists(entity)
+  if not entity or entity == 0 or type(DoesEntityExist) ~= 'function' then return false end
+  local ok, exists = pcall(DoesEntityExist, entity)
+  return ok and exists == true
+end
+
+local function encounterEntityDead(entity)
+  if not encounterEntityExists(entity) then return true end
+  if type(IsEntityDead) ~= 'function' then return false end
+  local ok, dead = pcall(IsEntityDead, entity)
+  return ok and dead == true
+end
+
+local function sessionEncounterList(session, kind)
+  session.entities = session.entities or { npcs = {}, props = {} }
+  session.entities.npcs = session.entities.npcs or {}
+  session.entities.props = session.entities.props or {}
+  return kind == 'npc' and session.entities.npcs or session.entities.props
+end
+
+local function encounterMarker(session, markerId, kind)
+  local marker = session.spawnPoints and session.spawnPoints[tostring(markerId)] or nil
+  if marker and marker.kind == kind then return marker end
+  return nil
+end
+
+local function deleteEncounterRecord(record)
+  if not record or not encounterEntityExists(record.entity) then
+    if record and record.entity then trackedEncounterEntities[tostring(record.entity)] = nil end
+    return
+  end
+  if type(DeleteEntity) == 'function' then pcall(DeleteEntity, record.entity) end
+  trackedEncounterEntities[tostring(record.entity)] = nil
+end
+
+cleanupSessionEncounters = function(session, force)
+  if not session or not session.entities then return end
+  if not force and Config.Encounters.cleanupOnEnd ~= true then return end
+  for _, kind in ipairs({ 'npcs', 'props' }) do
+    for index = #session.entities[kind], 1, -1 do
+      deleteEncounterRecord(session.entities[kind][index])
+      table.remove(session.entities[kind], index)
+    end
+  end
+end
+
+local function cleanupAllEncounterEntities()
+  for _, entity in pairs(trackedEncounterEntities) do
+    if encounterEntityExists(entity) and type(DeleteEntity) == 'function' then pcall(DeleteEntity, entity) end
+  end
+  trackedEncounterEntities = {}
+end
+
+local function createEncounterNpc(session, model, marker, health, offsetIndex)
+  if type(CreatePed) ~= 'function' then return nil, 'Server ped creation is unavailable.' end
+  local npcs = sessionEncounterList(session, 'npc')
+  if #npcs >= Config.Encounters.maxNpcsPerSession then return nil, 'The session reached its configured NPC limit.' end
+  local entry = allowedEncounterModel('ped', model)
+  if not entry then return nil, 'The ped model is not in the server allowlist.' end
+  local hash = type(model) == 'number' and model or GetHashKey(model)
+  local index = tonumber(offsetIndex) or 1
+  local angle = (index - 1) * 2.399963229728653
+  local distance = index == 1 and 0 or math.min(3, 0.8 + index * 0.2)
+  local x = tonumber(marker.x) + math.cos(angle) * distance
+  local y = tonumber(marker.y) + math.sin(angle) * distance
+  local ok, ped = pcall(CreatePed, 4, hash, x, y, tonumber(marker.z), tonumber(marker.heading) or 0, true, true)
+  if not ok or not ped or ped == 0 then return nil, 'RedM could not create the configured ped.' end
+  if type(SetEntityAsMissionEntity) == 'function' then pcall(SetEntityAsMissionEntity, ped, true, true) end
+  if type(SetEntityOrphanMode) == 'function' then pcall(SetEntityOrphanMode, ped, 2) end
+  if type(SetEntityMaxHealth) == 'function' then pcall(SetEntityMaxHealth, ped, health) end
+  if type(SetEntityHealth) == 'function' then pcall(SetEntityHealth, ped, health) end
+  local record = { entity = ped, model = model, groupId = session.runtimeId .. ':npc:' .. tostring(#npcs + 1) }
+  npcs[#npcs + 1] = record
+  trackedEncounterEntities[tostring(ped)] = ped
+  return record
+end
+
+local function createEncounterProp(session, model, marker)
+  if type(CreateObjectNoOffset) ~= 'function' then return nil, 'Server object creation is unavailable.' end
+  local props = sessionEncounterList(session, 'prop')
+  if #props >= Config.Encounters.maxPropsPerSession then return nil, 'The session reached its configured prop limit.' end
+  if not allowedEncounterModel('prop', model) then return nil, 'The prop model is not in the server allowlist.' end
+  local hash = type(model) == 'number' and model or GetHashKey(model)
+  local ok, entity = pcall(CreateObjectNoOffset, hash, tonumber(marker.x), tonumber(marker.y), tonumber(marker.z), true, true, false)
+  if not ok or not entity or entity == 0 then return nil, 'RedM could not create the configured prop.' end
+  if type(SetEntityHeading) == 'function' then pcall(SetEntityHeading, entity, tonumber(marker.heading) or 0) end
+  if type(SetEntityAsMissionEntity) == 'function' then pcall(SetEntityAsMissionEntity, entity, true, true) end
+  if type(SetEntityOrphanMode) == 'function' then pcall(SetEntityOrphanMode, entity, 2) end
+  local record = { entity = entity, model = model }
+  props[#props + 1] = record
+  trackedEncounterEntities[tostring(entity)] = entity
+  return record
+end
+
+local function applyEncounterAction(session, kind, data)
+  data = type(data) == 'table' and data or {}
+  if kind == 'spawn_npc' or kind == 'spawn_npc_group' then
+    local marker = encounterMarker(session, data.spawnPointId, 'npc')
+    if not marker then return false, 'Choose a saved NPC spawn marker for this story.' end
+    local count = kind == 'spawn_npc_group' and (tonumber(data.count) or 1) or 1
+    if #sessionEncounterList(session, 'npc') + count > Config.Encounters.maxNpcsPerSession then return false, 'The NPC count exceeds the remaining session limit.' end
+    local startingCount = #sessionEncounterList(session, 'npc')
+    for index = 1, count do
+      local record, reason = createEncounterNpc(session, data.model, marker, data.health or 150, startingCount + index)
+      if not record then return false, reason end
+    end
+    return true
+  elseif kind == 'spawn_prop' then
+    local marker = encounterMarker(session, data.spawnPointId, 'prop')
+    if not marker then return false, 'Choose a saved prop spawn marker for this story.' end
+    local record, reason = createEncounterProp(session, data.model, marker)
+    return record ~= nil, reason
+  elseif kind == 'remove_npc' then
+    local npcs = sessionEncounterList(session, 'npc')
+    for index = #npcs, 1, -1 do deleteEncounterRecord(npcs[index]); table.remove(npcs, index) end
+    return true
+  elseif kind == 'delete_prop' then
+    local props = sessionEncounterList(session, 'prop')
+    for index = #props, 1, -1 do deleteEncounterRecord(props[index]); table.remove(props, index) end
+    return true
+  elseif kind == 'make_npc_hostile' or kind == 'set_npc_target' then
+    local targets = flowAudiencePlayers(session)
+    if #targets == 0 then return true end
+    local npcs = sessionEncounterList(session, 'npc')
+    local usedTargets = flowActionTargets(session, data.target == 'all' and 'all' or 'random')
+    if #usedTargets == 0 then return true end
+    for index, npc in ipairs(npcs) do
+      if encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) then
+        local targetId = usedTargets[((index - 1) % #usedTargets) + 1]
+        local targetPed = GetPlayerPed(targetId)
+        if targetPed and targetPed ~= 0 and type(TaskCombatPed) == 'function' then pcall(TaskCombatPed, npc.entity, targetPed, 0, 16) end
+        if type(SetPedAsEnemy) == 'function' then pcall(SetPedAsEnemy, npc.entity, true) end
+      end
+    end
+    return true
+  elseif kind == 'patrol_route' then
+    local route = {}
+    for _, markerId in ipairs(data.markerIds or {}) do
+      local marker = encounterMarker(session, markerId, 'patrol')
+      if not marker then return false, 'A patrol waypoint is missing from this story.' end
+      route[#route + 1] = marker
+    end
+    if #route < 2 then return false, 'Patrol needs at least two saved waypoints.' end
+    local waitSeconds = boundedNumber(data.waitSeconds or 3, 1, Config.Encounters.maxPatrolWaitSeconds) or 3
+    for _, npc in ipairs(sessionEncounterList(session, 'npc')) do
+      if encounterEntityExists(npc.entity) and not encounterEntityDead(npc.entity) then
+        CreateThread(function()
+          while activeSession == session and encounterEntityExists(npc.entity) do
+            for _, marker in ipairs(route) do
+              if activeSession ~= session or not encounterEntityExists(npc.entity) then return end
+              if type(TaskGoStraightToCoord) == 'function' then
+                pcall(TaskGoStraightToCoord, npc.entity, tonumber(marker.x), tonumber(marker.y), tonumber(marker.z), 1.0, -1, tonumber(marker.heading) or 0, 0.0)
+              end
+              Wait(math.floor(waitSeconds * 1000))
+            end
+          end
+        end)
+      end
+    end
+    return true
+  end
+  return false, 'Unknown encounter action.'
+end
+
+local function encounterDeathSatisfied(session, all)
+  local npcs = sessionEncounterList(session, 'npc')
+  if #npcs == 0 then return true end
+  local deadCount = 0
+  for _, npc in ipairs(npcs) do
+    if encounterEntityDead(npc.entity) then deadCount = deadCount + 1 end
+  end
+  return all and deadCount == #npcs or (not all and deadCount > 0)
+end
+
+local worldNodeActions = {
+  door_open = 'open', door_close = 'close', door_lock = 'lock', door_unlock = 'unlock',
+  entity_enable = 'enable', entity_disable = 'disable', trigger_entity = 'trigger'
+}
+
+configuredWorldTarget = function(targetId)
+  return type(Config.World.targets) == 'table' and Config.World.targets[targetId] or nil
+end
+
+local function worldTargetDoorHash(target)
+  local value = target and target.doorHash
+  if type(value) == 'string' and value ~= '' then return GetHashKey(value) end
+  return tonumber(value)
+end
+
+local function resolveConfiguredWorldEntity(target)
+  if type(target) ~= 'table' or type(target.coords) ~= 'table' then return nil end
+  local x, y, z = tonumber(target.coords.x), tonumber(target.coords.y), tonumber(target.coords.z)
+  if not x or not y or not z then return nil end
+  local radius = boundedNumber(target.radius, 0.5, 100) or 5
+  local model = target.model
+  if type(model) == 'string' then model = GetHashKey(model) end
+  if type(model) ~= 'number' then return nil end
+  local entity
+  if target.kind == 'ped' and type(GetClosestPed) == 'function' then
+    local ok, result = pcall(GetClosestPed, x, y, z, radius, true, true, true, true, -1, model)
+    if ok then entity = result end
+  elseif type(GetClosestObjectOfType) == 'function' then
+    local ok, result = pcall(GetClosestObjectOfType, x, y, z, radius, model, false, false, false)
+    if ok then entity = result end
+  end
+  return entity and encounterEntityExists(entity) and entity or nil
+end
+
+local function readWorldTargetState(targetId, target)
+  if target.kind == 'door' then
+    local hash = worldTargetDoorHash(target)
+    if not hash or type(DoorSystemGetDoorState) ~= 'function' or type(DoorSystemGetOpenRatio) ~= 'function' then
+      return nil, 'Door-system state inspection is unavailable for this registered target.'
+    end
+    local okState, state = pcall(DoorSystemGetDoorState, hash)
+    local okRatio, ratio = pcall(DoorSystemGetOpenRatio, hash)
+    if not okState or not okRatio then return nil, 'The registered door target could not be read.' end
+    return { kind = 'door', doorHash = hash, doorState = state, openRatio = ratio }
+  end
+  local entity = resolveConfiguredWorldEntity(target)
+  if not entity then return nil, 'The registered world entity could not be found near its configured position.' end
+  if type(IsEntityVisible) ~= 'function' or type(GetEntityCollisionDisabled) ~= 'function' then
+    return nil, 'Entity visibility and collision state inspection is unavailable on this RedM server.'
+  end
+  local okVisible, visible = pcall(IsEntityVisible, entity)
+  local okCollision, collisionDisabled = pcall(GetEntityCollisionDisabled, entity)
+  if not okVisible or not okCollision then return nil, 'The registered entity state could not be read.' end
+  return { kind = 'entity', entity = entity, visible = visible, collisionDisabled = collisionDisabled }
+end
+
+local function applyWorldTargetState(state)
+  if not state then return false end
+  if state.kind == 'door' then
+    if type(DoorSystemSetDoorState) ~= 'function' or type(DoorSystemSetOpenRatio) ~= 'function' then return false end
+    pcall(DoorSystemSetDoorState, state.doorHash, state.doorState, true, true)
+    pcall(DoorSystemSetOpenRatio, state.doorHash, state.openRatio, true, true)
+    return true
+  end
+  if not encounterEntityExists(state.entity) or type(SetEntityVisible) ~= 'function' or type(SetEntityCollision) ~= 'function' then return false end
+  pcall(SetEntityVisible, state.entity, state.visible, false)
+  pcall(SetEntityCollision, state.entity, not state.collisionDisabled, not state.collisionDisabled)
+  return true
+end
+
+cleanupSessionWorld = function(session)
+  if not session or not session.worldChanges then return end
+  for targetId, state in pairs(session.worldChanges) do
+    local target = configuredWorldTarget(targetId)
+    if target and target.restoreOnSessionEnd == true then applyWorldTargetState(state) end
+  end
+  session.worldChanges = nil
+end
+
+applyWorldAction = function(session, targetId, action)
+  local target = configuredWorldTarget(targetId)
+  if type(target) ~= 'table' or type(target.actions) ~= 'table' or target.actions[action] ~= true then
+    return false, 'The requested action is not enabled for this registered world target.'
+  end
+  if ({ open = true, close = true, lock = true, unlock = true })[action] and target.kind ~= 'door' then
+    return false, 'Door operations require a registered door target.'
+  end
+  if ({ enable = true, disable = true })[action] and target.kind ~= 'entity' then
+    return false, 'Enable/disable operations require a registered entity target.'
+  end
+  if action == 'trigger' then
+    if target.restoreOnSessionEnd == true then return false, 'Trigger targets must use a persistent target policy.' end
+    if type(target.triggerEvent) ~= 'string' or not target.triggerEvent:match('^[%w_:%-%.]+$') then return false, 'The configured target has no valid server event.' end
+    TriggerEvent(target.triggerEvent, targetId)
+    return true
+  end
+  local state, reason = readWorldTargetState(targetId, target)
+  if not state then return false, reason end
+  session.worldChanges = session.worldChanges or {}
+  if not session.worldChanges[targetId] then session.worldChanges[targetId] = state end
+  if state.kind == 'door' then
+    local hash = state.doorHash
+    if action == 'open' or action == 'close' then
+      if type(DoorSystemSetOpenRatio) ~= 'function' then return false, 'Door open control is unavailable.' end
+      local ratio = action == 'open' and (tonumber(target.openRatio) or -1.0) or 0.0
+      DoorSystemSetOpenRatio(hash, ratio, true, true)
+    else
+      if type(DoorSystemSetDoorState) ~= 'function' then return false, 'Door lock control is unavailable.' end
+      DoorSystemSetDoorState(hash, action == 'lock' and 1 or 0, true, true)
+    end
+  else
+    if not encounterEntityExists(state.entity) then return false, 'The registered entity disappeared before its action ran.' end
+    if action == 'enable' or action == 'disable' then
+      local enabled = action == 'enable'
+      SetEntityVisible(state.entity, enabled, false)
+      SetEntityCollision(state.entity, enabled, enabled)
+    else
+      return false, 'That action is not supported for an entity target.'
+    end
+  end
+  return true
+end
+
+cleanupSessionEffects = function(session)
+  if not session then return end
+  for _, id in ipairs(flowAudiencePlayers(session)) do
+    TriggerClientEvent('arachnid_storyteller:storyEffect', id, { kind = 'cleanup' })
+  end
+  session.effects = nil
+end
+
+local function applyStoryEffect(session, kind, data)
+  local targets = flowAudiencePlayers(session)
+  if #targets == 0 then return true end
+  session.effects = session.effects or { sounds = {} }
+  session.effects.sounds = session.effects.sounds or {}
+  if kind == 'play_sound' then
+    local sound = allowedEffectSound(data.soundId)
+    if not sound then return false, 'The sound was removed from the server allowlist.' end
+    session.effects.sounds[data.soundId] = true
+    local payload = { kind = kind, soundId = data.soundId, name = sound.name, set = sound.set, volume = data.volume, pitch = data.pitch }
+    for _, id in ipairs(targets) do TriggerClientEvent('arachnid_storyteller:storyEffect', id, payload) end
+  elseif kind == 'stop_sound' then
+    if session.effects.sounds[data.soundId] then
+      for _, id in ipairs(targets) do TriggerClientEvent('arachnid_storyteller:storyEffect', id, { kind = kind, soundId = data.soundId }) end
+      session.effects.sounds[data.soundId] = nil
+    end
+  else
+    for _, id in ipairs(targets) do TriggerClientEvent('arachnid_storyteller:storyEffect', id, { kind = kind, data = data }) end
+  end
+  return true
+end
+
 local function flowActionTargets(session, targetMode)
   local targets = flowAudiencePlayers(session)
   if targetMode == 'random' then
@@ -655,7 +1387,44 @@ local function flowActionTargets(session, targetMode)
   return targets
 end
 
-local function vorpCharacterFor(sourceId, core)
+local function startSessionCutscene(session, sceneId)
+  local scene
+  for _, candidate in ipairs(session.scenes or {}) do
+    if tonumber(candidate.id) == tonumber(sceneId) then scene = candidate break end
+  end
+  if not scene then return false, 'That scene is not part of the active story.' end
+  local payload, reason = cutscenePayload(scene, scene.cutscene_settings)
+  if not payload then return false, reason end
+  stopSessionCutscene(session)
+  payload.runtimeId = session.runtimeId
+  session.cutscene = {
+    sceneId = tonumber(scene.id),
+    loop = payload.settings.loop,
+    finishAt = payload.settings.loop and nil or (GetGameTimer() + math.floor(payload.duration * 1000)),
+    remaining = payload.duration * 1000,
+    paused = false
+  }
+  for _, id in ipairs(flowAudiencePlayers(session)) do TriggerClientEvent('arachnid_storyteller:cutscenePlay', id, payload) end
+  return true, payload
+end
+
+local function pauseSessionCutscene(session)
+  if not session or not session.cutscene or session.cutscene.paused then return end
+  local cutscene = session.cutscene
+  if cutscene.finishAt then cutscene.remaining = math.max(0, cutscene.finishAt - GetGameTimer()) end
+  cutscene.finishAt, cutscene.paused = nil, true
+  for _, id in ipairs(flowAudiencePlayers(session)) do TriggerClientEvent('arachnid_storyteller:cutscenePause', id) end
+end
+
+local function resumeSessionCutscene(session)
+  if not session or not session.cutscene or not session.cutscene.paused then return end
+  local cutscene = session.cutscene
+  cutscene.paused = false
+  if not cutscene.loop then cutscene.finishAt = GetGameTimer() + (cutscene.remaining or 0) end
+  for _, id in ipairs(flowAudiencePlayers(session)) do TriggerClientEvent('arachnid_storyteller:cutsceneResume', id) end
+end
+
+vorpCharacterFor = function(sourceId, core)
   if not core or type(core.getUser) ~= 'function' then return nil end
   local ok, user = pcall(core.getUser, sourceId)
   if not ok then return nil end
@@ -811,57 +1580,90 @@ local function flowFault(message)
 end
 
 local function flowTick()
-  if not activeSession or not activeSession.flowRuntime then return end
-  local session, runtime = activeSession, activeSession.flowRuntime
+  local session = activeSession
+  if session and session.cutscene and not session.cutscene.paused and not session.cutscene.loop and
+    session.cutscene.finishAt and GetGameTimer() >= session.cutscene.finishAt then
+    stopSessionCutscene(session)
+    broadcastSession('cutscene_completed', session)
+  end
+  if not session or not session.flowRuntime then return end
+  local runtime = session.flowRuntime
   if runtime.paused then return end
-  local waiting = runtime.waiting
-  if waiting then
-    local ready, port = false, waiting.port
+
+  for index = #runtime.waiters, 1, -1 do
+    local waiting = runtime.waiters[index]
+    local ready, port = false, waiting.port or 'next'
     if waiting.kind == 'delay' then
       ready = waiting.untilTime and GetGameTimer() >= waiting.untilTime or false
     elseif waiting.kind == 'objective' then
       local status = session.objective and session.objective.status
       if status == 'completed' or status == 'failed' then ready, port = true, status end
     elseif waiting.kind == 'area' then
-      ready = flowAreaSatisfied(session, waiting.area)
+      ready = flowAreaCondition(session, waiting.area, waiting.condition)
+    elseif waiting.kind == 'cutscene' then
+      local cutscene = session.cutscene
+      ready = not cutscene or (not cutscene.paused and not cutscene.loop and cutscene.finishAt and GetGameTimer() >= cutscene.finishAt)
+      if ready and cutscene then stopSessionCutscene(session) end
+    elseif waiting.kind == 'npc_death' then
+      ready = encounterDeathSatisfied(session, false)
+    elseif waiting.kind == 'npcs_dead' then
+      ready = encounterDeathSatisfied(session, true)
     end
-    if not ready then return end
-    runtime.waiting = nil
-    runtime.currentNode = flowRoute(runtime, waiting.nodeId, port)
+    if ready then
+      table.remove(runtime.waiters, index)
+      flowEnqueueRoute(runtime, waiting.nodeId, port)
+    end
   end
 
   local steps = 0
-  while activeSession == session and not runtime.paused and runtime.currentNode and steps < Config.Flow.maxStepsPerTick do
-    local node = runtime.nodes[runtime.currentNode]
+  while activeSession == session and not runtime.paused and #runtime.queue > 0 and steps < Config.Flow.maxStepsPerTick do
+    local token = table.remove(runtime.queue, 1)
+    local node = runtime.nodes[token.nodeId]
     if not node then return flowFault('Flow reached a missing node.') end
-    runtime.currentNode = nil
     steps = steps + 1
     local nextPort = 'next'
-    if node.type == 'start' then
-      runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+
+    if node.type == 'and_node' then
+      local arrivals = runtime.joinArrivals[node.id] or {}
+      arrivals[token.inputPort] = true
+      runtime.joinArrivals[node.id] = arrivals
+      if arrivals.a and arrivals.b and not runtime.joinFired[node.id] then
+        runtime.joinFired[node.id] = true
+        flowEnqueueRoute(runtime, node.id, nextPort)
+      end
+    elseif node.type == 'or_node' then
+      if not runtime.joinFired[node.id] then
+        runtime.joinFired[node.id] = true
+        flowEnqueueRoute(runtime, node.id, nextPort)
+      end
+    elseif node.type == 'start' then
+      flowEnqueueRoute(runtime, node.id, nextPort)
     elseif node.type == 'scene' then
       local targetIndex
-      for index, scene in ipairs(session.scenes) do if tonumber(scene.id) == tonumber(node.data.sceneId) then targetIndex = index break end end
+      for sceneIndex, scene in ipairs(session.scenes) do
+        if tonumber(scene.id) == tonumber(node.data.sceneId) then targetIndex = sceneIndex break end
+      end
       if not targetIndex then return flowFault('A scene referenced by the active flow was removed.') end
       activateSessionScene(targetIndex, session.startedBy)
       broadcastSession('flow_scene')
-      runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+      flowEnqueueRoute(runtime, node.id, nextPort)
     elseif node.type == 'delay' then
       if node.data.seconds <= 0 then
-        runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+        flowEnqueueRoute(runtime, node.id, nextPort)
       else
-        runtime.waiting = { kind = 'delay', nodeId = node.id, port = nextPort, untilTime = GetGameTimer() + math.floor(node.data.seconds * 1000) }
-        broadcastSession('flow_waiting')
-        return
+        runtime.waiters[#runtime.waiters + 1] = {
+          kind = 'delay', nodeId = node.id, port = nextPort,
+          untilTime = GetGameTimer() + math.floor(node.data.seconds * 1000)
+        }
       end
     elseif node.type == 'branch' then
-      runtime.currentNode = flowRoute(runtime, node.id, flowCompare(runtime, node.data) and 'true' or 'false')
+      flowEnqueueRoute(runtime, node.id, flowCompare(runtime, node.data) and 'true' or 'false')
     elseif node.type == 'random_branch' then
       local succeeds = math.random(1, 10000) <= math.floor(node.data.chance * 100)
-      runtime.currentNode = flowRoute(runtime, node.id, succeeds and 'success' or 'failure')
+      flowEnqueueRoute(runtime, node.id, succeeds and 'success' or 'failure')
     elseif node.type == 'set_variable' then
       runtime.variables[node.data.variable] = { type = node.data.valueType, value = node.data.value }
-      runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+      flowEnqueueRoute(runtime, node.id, nextPort)
     elseif node.type == 'add_variable' or node.type == 'subtract_variable' then
       local current = runtime.variables[node.data.variable]
       if current and current.type ~= 'number' then return flowFault('Add/subtract requires a numeric variable: ' .. node.data.variable) end
@@ -870,34 +1672,85 @@ local function flowTick()
       local result = value + amount
       if result ~= result or math.abs(result) > Config.Flow.maxVariableNumber then return flowFault('Variable result exceeds the configured limit.') end
       runtime.variables[node.data.variable] = { type = 'number', value = result }
-      runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+      flowEnqueueRoute(runtime, node.id, nextPort)
     elseif node.type == 'objective' then
       session.objective = { text = node.data.text, status = 'active', updatedAt = os.time(), updatedBy = session.startedBy }
       broadcastSession('objective_updated')
-      runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+      flowEnqueueRoute(runtime, node.id, nextPort)
+    elseif node.type == 'complete_objective' or node.type == 'fail_objective' then
+      local status = node.type == 'complete_objective' and 'completed' or 'failed'
+      session.objective = session.objective or { text = '', updatedBy = session.startedBy }
+      session.objective.status, session.objective.updatedAt, session.objective.updatedBy = status, os.time(), session.startedBy
+      broadcastSession('objective_' .. status)
+      flowEnqueueRoute(runtime, node.id, nextPort)
     elseif node.type == 'wait_objective' then
       local status = session.objective and session.objective.status
       if status == 'completed' or status == 'failed' then
-        runtime.currentNode = flowRoute(runtime, node.id, status)
+        flowEnqueueRoute(runtime, node.id, status)
       else
-        runtime.waiting = { kind = 'objective', nodeId = node.id }
-        broadcastSession('flow_waiting')
-        return
+        runtime.waiters[#runtime.waiters + 1] = { kind = 'objective', nodeId = node.id, port = 'completed' }
       end
-    elseif node.type == 'wait_area' then
+    elseif node.type == 'wait_area' or node.type == 'wait_all_in_area' or node.type == 'wait_area_empty' then
       local area = runtime.areas[tostring(node.data.areaId)]
       if not area then return flowFault('An area referenced by the active flow is unavailable.') end
-      if flowAreaSatisfied(session, area) then
-        runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+      local condition = node.type == 'wait_area' and 'any' or node.type == 'wait_all_in_area' and 'all' or 'empty'
+      if flowAreaCondition(session, area, condition) then
+        flowEnqueueRoute(runtime, node.id, nextPort)
       else
-        runtime.waiting = { kind = 'area', nodeId = node.id, port = nextPort, area = area }
-        broadcastSession('flow_waiting')
-        return
+        runtime.waiters[#runtime.waiters + 1] = {
+          kind = 'area', nodeId = node.id, port = nextPort, area = area, condition = condition
+        }
       end
+    elseif node.type == 'check_player_count' then
+      local count = #flowAudiencePlayers(session)
+      local passed = flowCountMatches(count, node.data.operator, node.data.count)
+      flowEnqueueRoute(runtime, node.id, passed and 'true' or 'false')
+    elseif node.type == 'check_job' then
+      flowEnqueueRoute(runtime, node.id, flowAudienceHasJob(session, node.data.jobName) and 'true' or 'false')
+    elseif node.type == 'check_entity_alive' then
+      flowEnqueueRoute(runtime, node.id, flowConfiguredEntityAlive(node.data.targetId) and 'true' or 'false')
+    elseif flowWorldActions[node.type] then
+      flowEnqueueRoute(runtime, node.id, nextPort)
+      local callOk, actionOk, actionError = pcall(applyWorldAction, session, node.data.targetId, flowWorldActions[node.type])
+      if not callOk then return flowFault(tostring(actionOk)) end
+      if not actionOk then return flowFault(actionError) end
+    elseif flowFeatureNodes.effects[node.type] then
+      flowEnqueueRoute(runtime, node.id, nextPort)
+      local callOk, actionOk, actionError = pcall(applyStoryEffect, session, node.type, node.data)
+      if not callOk then return flowFault(tostring(actionOk)) end
+      if not actionOk then return flowFault(actionError) end
+    elseif node.type == 'not_node' then
+      flowEnqueueRoute(runtime, node.id, nextPort)
+    elseif node.type == 'play_cutscene' then
+      local ok, reason = startSessionCutscene(session, node.data.sceneId)
+      if not ok then return flowFault(reason) end
+      flowEnqueueRoute(runtime, node.id, nextPort)
+    elseif node.type == 'wait_cutscene' then
+      local cutscene = session.cutscene
+      if not cutscene or (not cutscene.loop and not cutscene.paused and cutscene.finishAt and GetGameTimer() >= cutscene.finishAt) then
+        if cutscene then stopSessionCutscene(session) end
+        flowEnqueueRoute(runtime, node.id, nextPort)
+      else
+        runtime.waiters[#runtime.waiters + 1] = { kind = 'cutscene', nodeId = node.id, port = nextPort }
+      end
+    elseif node.type == 'stop_cutscene' then
+      stopSessionCutscene(session)
+      flowEnqueueRoute(runtime, node.id, nextPort)
+    elseif node.type == 'wait_npc_death' or node.type == 'wait_npcs_dead' then
+      local all = node.type == 'wait_npcs_dead'
+      if encounterDeathSatisfied(session, all) then
+        flowEnqueueRoute(runtime, node.id, nextPort)
+      else
+        runtime.waiters[#runtime.waiters + 1] = { kind = all and 'npcs_dead' or 'npc_death', nodeId = node.id, port = nextPort }
+      end
+    elseif flowFeatureNodes.encounters[node.type] then
+      flowEnqueueRoute(runtime, node.id, nextPort)
+      local callOk, actionOk, actionError = pcall(applyEncounterAction, session, node.type, node.data)
+      if not callOk then return flowFault(tostring(actionOk)) end
+      if not actionOk then return flowFault(actionError) end
     elseif flowActionSettings[node.type] then
-      -- Advance before calling the effect so Resume cannot execute a partially
-      -- completed action again if one target causes the node to pause.
-      runtime.currentNode = flowRoute(runtime, node.id, nextPort)
+      -- Queue the next node before applying the action so Resume cannot repeat it.
+      flowEnqueueRoute(runtime, node.id, nextPort)
       local callOk, actionOk, actionError = pcall(executePlayerAction, session, node)
       if not callOk then return flowFault(tostring(actionOk)) end
       if not actionOk then return flowFault(actionError) end
@@ -907,11 +1760,13 @@ local function flowTick()
     else
       return flowFault('Flow contains an unsupported node type.')
     end
-    if not runtime.currentNode and activeSession == session then return flowFault('Flow reached an unconnected output.') end
   end
-  if steps >= Config.Flow.maxStepsPerTick and runtime.currentNode then broadcastSession('flow_running') end
-end
 
+  if activeSession == session then
+    if #runtime.queue == 0 and #runtime.waiters > 0 then broadcastSession('flow_waiting') end
+    if steps >= Config.Flow.maxStepsPerTick and #runtime.queue > 0 then broadcastSession('flow_running') end
+  end
+end
 local function storyForSession(id)
   local rows = MySQL.query.await('SELECT id,title,status FROM arachnid_storyteller_stories WHERE id=? LIMIT 1', { id })
   if type(rows) ~= 'table' or not rows[1] then return nil, 'That story no longer exists.' end
@@ -922,6 +1777,24 @@ local function storyForSession(id)
   local scenes = MySQL.query.await([[SELECT id,title,objective,sort_order,x,y,z
     FROM arachnid_storyteller_scenes WHERE story_id=? ORDER BY sort_order ASC,id ASC]], { id }) or {}
   if #scenes == 0 then return nil, 'Add at least one scene beat before starting a session.' end
+  local points = MySQL.query.await([[SELECT points.id,points.scene_id,points.label,points.message,points.sort_order,points.x,points.y,points.z,
+      points.heading,points.fov,points.hold_duration,points.transition_duration
+    FROM arachnid_storyteller_camera_points AS points
+    INNER JOIN arachnid_storyteller_scenes AS scenes ON scenes.id=points.scene_id
+    WHERE scenes.story_id=? ORDER BY points.scene_id,points.sort_order,points.id]], { id }) or {}
+  local pointsByScene = {}
+  for _, point in ipairs(points) do
+    pointsByScene[tostring(point.scene_id)] = pointsByScene[tostring(point.scene_id)] or {}
+    pointsByScene[tostring(point.scene_id)][#pointsByScene[tostring(point.scene_id)] + 1] = point
+  end
+  for _, scene in ipairs(scenes) do
+    scene.cutscene_settings = sceneCutsceneSettings(scene.id)
+    scene.camera_points = pointsByScene[tostring(scene.id)] or {}
+  end
+  local spawnPoints = MySQL.query.await([[SELECT id,story_id,label,kind,x,y,z,heading
+    FROM arachnid_storyteller_spawn_points WHERE story_id=? ORDER BY kind,label,id]], { id }) or {}
+  local spawnById = {}
+  for _, marker in ipairs(spawnPoints) do spawnById[tostring(marker.id)] = marker end
   local flowRows = MySQL.query.await('SELECT graph_json FROM arachnid_storyteller_flows WHERE story_id=? LIMIT 1', { id }) or {}
   local flow = nil
   if flowRows[1] then
@@ -929,7 +1802,7 @@ local function storyForSession(id)
     if not decoded or type(value) ~= 'table' then return nil, 'Saved flow data is invalid; open and resave the graph.' end
     flow = value
   end
-  return { id = story.id, title = story.title, scenes = scenes, flow = flow }
+  return { id = story.id, title = story.title, scenes = scenes, flow = flow, spawnPoints = spawnById }
 end
 
 local function snapshot()
@@ -938,6 +1811,13 @@ local function snapshot()
     ORDER BY FIELD(status,'published','draft','archived'),updated_at DESC,id DESC]]) or {}
   local scenes = MySQL.query.await([[SELECT id,story_id,title,objective,sort_order,x,y,z,created_by,created_at,updated_at
     FROM arachnid_storyteller_scenes ORDER BY story_id ASC,sort_order ASC,id ASC]]) or {}
+  local cutsceneRows = MySQL.query.await('SELECT scene_id,settings_json FROM arachnid_storyteller_cutscene_settings') or {}
+  local cutsceneSettingsByScene = {}
+  for _, row in ipairs(cutsceneRows) do
+    local ok, value = pcall(json.decode, row.settings_json)
+    local settings = ok and normalizedCutsceneSettings(value) or nil
+    if settings then cutsceneSettingsByScene[tostring(row.scene_id)] = settings end
+  end
   local cameraPoints = MySQL.query.await([[SELECT id,scene_id,label,message,sort_order,x,y,z,heading,fov,hold_duration,
     transition_duration,created_by,created_at,updated_at FROM arachnid_storyteller_camera_points
     ORDER BY scene_id ASC,sort_order ASC,id ASC]]) or {}
@@ -945,6 +1825,8 @@ local function snapshot()
     FROM arachnid_storyteller_areas ORDER BY label ASC,id ASC]]) or {}
   local teleports = MySQL.query.await([[SELECT id,story_id,label,x,y,z,heading,created_by,created_at,updated_at
     FROM arachnid_storyteller_teleports ORDER BY story_id ASC,label ASC,id ASC]]) or {}
+  local spawnPoints = MySQL.query.await([[SELECT id,story_id,label,kind,x,y,z,heading,created_by,created_at,updated_at
+    FROM arachnid_storyteller_spawn_points ORDER BY story_id ASC,kind ASC,label ASC,id ASC]]) or {}
   local flowRows = MySQL.query.await('SELECT story_id,graph_json,updated_by,updated_at FROM arachnid_storyteller_flows') or {}
   local flowsByStory = {}
   for _, row in ipairs(flowRows) do
@@ -958,13 +1840,19 @@ local function snapshot()
   end
   local scenesByStory = {}
   local teleportsByStory = {}
+  local spawnPointsByStory = {}
   for _, marker in ipairs(teleports) do
     teleportsByStory[marker.story_id] = teleportsByStory[marker.story_id] or {}
     teleportsByStory[marker.story_id][#teleportsByStory[marker.story_id] + 1] = marker
   end
+  for _, marker in ipairs(spawnPoints) do
+    spawnPointsByStory[marker.story_id] = spawnPointsByStory[marker.story_id] or {}
+    spawnPointsByStory[marker.story_id][#spawnPointsByStory[marker.story_id] + 1] = marker
+  end
   for _, scene in ipairs(scenes) do
     scene.camera_points = camerasByScene[scene.id] or {}
     scene.camera_point_count = #scene.camera_points
+    scene.cutscene_settings = cutsceneSettingsByScene[tostring(scene.id)] or defaultCutsceneSettings()
     scenesByStory[scene.story_id] = scenesByStory[scene.story_id] or {}
     scenesByStory[scene.story_id][#scenesByStory[scene.story_id] + 1] = scene
   end
@@ -973,6 +1861,7 @@ local function snapshot()
     story.scene_count = #story.scenes
     story.flow = flowsByStory[tostring(story.id)]
     story.teleports = teleportsByStory[story.id] or {}
+    story.spawnPoints = spawnPointsByStory[story.id] or {}
   end
   local actionConfig = Config.PlayerActions
   local playerActions = {
@@ -1008,6 +1897,41 @@ local function snapshot()
     end
   end
   table.sort(playerActions.jobs, function(left, right) return left.label < right.label end)
+  local worldTargets = {}
+  for targetId, target in pairs(type(Config.World.targets) == 'table' and Config.World.targets or {}) do
+    if type(targetId) == 'string' and type(target) == 'table' then
+      worldTargets[#worldTargets + 1] = {
+        id = targetId, label = cleanText(target.label or targetId, 100, true) or targetId,
+        kind = target.kind, actions = type(target.actions) == 'table' and target.actions or {},
+        restoreOnSessionEnd = target.restoreOnSessionEnd == true
+      }
+    end
+  end
+  table.sort(worldTargets, function(left, right) return left.label < right.label end)
+  local encounterConfig = Config.Encounters or {}
+  local encounterModels = { ped = {}, prop = {} }
+  for _, pair in ipairs({ { 'ped', encounterConfig.pedModels }, { 'prop', encounterConfig.propModels } }) do
+    local kind, models = pair[1], type(pair[2]) == 'table' and pair[2] or {}
+    for model, entry in pairs(models) do
+      local allow = allowedEncounterModel(kind, model)
+      if allow and type(model) == 'string' then
+        encounterModels[kind][#encounterModels[kind] + 1] = {
+          name = model,
+          label = cleanText(type(entry) == 'table' and entry.label or model, 100, true) or model,
+          maxHealth = kind == 'ped' and maxPedHealth(allow) or encounterConfig.maxNpcHealth
+        }
+      end
+    end
+    table.sort(encounterModels[kind], function(left, right) return left.label < right.label end)
+  end
+  local effectsConfig = Config.Effects or {}
+  local sounds = {}
+  for soundId, sound in pairs(type(effectsConfig.sounds) == 'table' and effectsConfig.sounds or {}) do
+    if type(soundId) == 'string' and allowedEffectSound(soundId) then
+      sounds[#sounds + 1] = { id = soundId, label = cleanText(sound.label or soundId, 100, true) or soundId }
+    end
+  end
+  table.sort(sounds, function(left, right) return left.label < right.label end)
   return {
     stories = stories,
     session = activeSession and sessionPayload('snapshot') or nil,
@@ -1022,12 +1946,41 @@ local function snapshot()
     flowLimits = {
       maxNodes = Config.Flow.maxNodes,
       maxLinks = Config.Flow.maxLinks,
-      maxDelaySeconds = Config.Flow.maxDelaySeconds
+      maxDelaySeconds = Config.Flow.maxDelaySeconds,
+      maxParticipants = Config.Session.maxParticipants
     },
     camera = {
       defaultPlacementDistance = Config.Camera.Tool.defaultPlacementDistance,
       maxPlacementDistance = Config.Camera.Tool.maxPlacementDistance,
       toolConfigured = Config.Camera.Tool.weapon ~= ''
+    },
+    cutscenes = {
+      enabled = Config.Cutscenes.enabled == true,
+      maxFadeSeconds = Config.Cutscenes.maxFadeSeconds,
+      minFov = Config.Cutscenes.minFov,
+      maxFov = Config.Cutscenes.maxFov,
+      defaults = defaultCutsceneSettings()
+    },
+    world = { enabled = Config.World.enabled == true, targets = worldTargets },
+    encounters = {
+      enabled = encounterConfig.enabled == true,
+      maxNpcsPerSession = encounterConfig.maxNpcsPerSession,
+      maxPropsPerSession = encounterConfig.maxPropsPerSession,
+      maxGroupCount = encounterConfig.maxGroupCount,
+      maxNpcHealth = encounterConfig.maxNpcHealth,
+      maxPatrolWaitSeconds = encounterConfig.maxPatrolWaitSeconds,
+      models = encounterModels
+    },
+    effects = {
+      enabled = effectsConfig.enabled == true,
+      sounds = sounds,
+      maxDurationSeconds = effectsConfig.maxDurationSeconds,
+      maxVolume = effectsConfig.maxVolume,
+      minPitch = effectsConfig.minPitch,
+      maxPitch = effectsConfig.maxPitch,
+      maxShakeAmplitude = effectsConfig.maxShakeAmplitude,
+      maxShakeFrequency = effectsConfig.maxShakeFrequency,
+      maxMessageLength = effectsConfig.maxMessageLength
     },
     playerActions = playerActions,
     serverTime = os.date('!%Y-%m-%d %H:%M:%S UTC')
@@ -1160,6 +2113,28 @@ RegisterNetEvent('arachnid_storyteller:cameraPointDelete', function(rawId)
   if not ok or not point then return feedback(src, 'Camera point deletion failed: ' .. tostring(ok and reason or point)) end
   logAction(src, ('Deleted camera point #%s: %s'):format(tostring(id), tostring(point.label):sub(1, 80)))
   feedback(src, 'Camera point deleted.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sceneCutsceneSettingsSave', function(raw)
+  local src = source
+  if not canManage(src) or not databaseReady or type(raw) ~= 'table' then return end
+  local sceneId = positiveInteger(raw.sceneId)
+  local settings, reason = normalizedCutsceneSettings(raw.settings)
+  if not sceneId or not settings then return feedback(src, reason or 'Invalid scene identifier.') end
+  local scene = sceneRecord(sceneId)
+  if not scene then return feedback(src, 'That scene no longer exists.') end
+  local actor = actorName(src)
+  local ok, err = pcall(function()
+    MySQL.insert.await([[INSERT INTO arachnid_storyteller_cutscene_settings (scene_id,settings_json,updated_by)
+      VALUES (?,?,?) ON DUPLICATE KEY UPDATE settings_json=VALUES(settings_json),updated_by=VALUES(updated_by)]],
+      { sceneId, json.encode(settings), actor })
+    MySQL.update.await('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actor, scene.story_id })
+  end)
+  if not ok then return feedback(src, 'Cutscene settings could not be saved: ' .. tostring(err)) end
+  logAction(src, ('Saved cutscene settings for scene #%s'):format(tostring(sceneId)))
+  TriggerClientEvent('arachnid_storyteller:select', src, { storyId = scene.story_id, sceneId = sceneId })
+  feedback(src, 'Cutscene settings saved.')
+  sendData(src, false)
 end)
 
 RegisterNetEvent('arachnid_storyteller:areaSave', function(raw)
@@ -1307,6 +2282,67 @@ RegisterNetEvent('arachnid_storyteller:teleportDelete', function(rawId, rawStory
   feedback(src, 'Teleport marker deleted.')
 end)
 
+RegisterNetEvent('arachnid_storyteller:spawnPointSave', function(raw)
+  local src = source
+  if not canManage(src) or not databaseReady or type(raw) ~= 'table' then return end
+  local storyId = positiveInteger(raw.storyId)
+  local id = raw.id ~= nil and raw.id ~= '' and positiveInteger(raw.id) or nil
+  local label = cleanText(raw.label, Config.Limits.spawnPointLabel, true)
+  local kind = type(raw.kind) == 'string' and raw.kind:lower() or nil
+  if not storyId or not storyExists(storyId) or not label or not ({ npc = true, prop = true, patrol = true })[kind] or
+    (raw.id ~= nil and raw.id ~= '' and not id) then
+    return feedback(src, 'Spawn marker story, label, kind, or identifier is invalid.')
+  end
+  local existing
+  if id then
+    local rows = MySQL.query.await('SELECT id FROM arachnid_storyteller_spawn_points WHERE id=? AND story_id=? LIMIT 1', { id, storyId }) or {}
+    existing = rows[1]
+    if not existing then return feedback(src, 'That spawn marker no longer exists in this story.') end
+  end
+  local capture = raw.capturePosition == true or not existing
+  local position, heading
+  if capture then
+    position = currentPosition(src)
+    local ped = GetPlayerPed(src)
+    if not position or not ped or ped == 0 then return feedback(src, 'Current position is unavailable. Ensure OneSync is enabled and try again.') end
+    heading = math.floor(GetEntityHeading(ped) * 100) / 100
+  end
+  local actor = actorName(src)
+  local ok, result = pcall(function()
+    if existing then
+      if capture then
+        MySQL.update.await([[UPDATE arachnid_storyteller_spawn_points
+          SET label=?,kind=?,x=?,y=?,z=?,heading=? WHERE id=? AND story_id=?]],
+          { label, kind, position.x, position.y, position.z, heading, id, storyId })
+      else
+        MySQL.update.await('UPDATE arachnid_storyteller_spawn_points SET label=?,kind=? WHERE id=? AND story_id=?', { label, kind, id, storyId })
+      end
+      return id
+    end
+    return MySQL.insert.await([[INSERT INTO arachnid_storyteller_spawn_points
+      (story_id,label,kind,x,y,z,heading,created_by) VALUES (?,?,?,?,?,?,?,?)]],
+      { storyId, label, kind, position.x, position.y, position.z, heading, actor })
+  end)
+  if not ok or not result then return feedback(src, 'Spawn marker save failed: ' .. tostring(result)) end
+  MySQL.update('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actor, storyId })
+  logAction(src, ('Saved %s spawn marker #%s for story #%s: %s'):format(kind, tostring(result), tostring(storyId), label:sub(1, 80)))
+  TriggerClientEvent('arachnid_storyteller:select', src, { storyId = storyId, spawnPointId = result })
+  feedback(src, 'Spawn marker saved.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:spawnPointDelete', function(rawId, rawStoryId)
+  local src = source
+  if not canManage(src) or not databaseReady then return end
+  local id, storyId = positiveInteger(rawId), positiveInteger(rawStoryId)
+  if not id or not storyId then return feedback(src, 'Invalid spawn marker or story identifier.') end
+  local rows = MySQL.query.await('SELECT label,kind FROM arachnid_storyteller_spawn_points WHERE id=? AND story_id=? LIMIT 1', { id, storyId }) or {}
+  if not rows[1] then return feedback(src, 'That spawn marker no longer exists in this story.') end
+  MySQL.update.await('DELETE FROM arachnid_storyteller_spawn_points WHERE id=? AND story_id=?', { id, storyId })
+  MySQL.update('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actorName(src), storyId })
+  logAction(src, ('Deleted %s spawn marker #%s from story #%s: %s'):format(tostring(rows[1].kind), tostring(id), tostring(storyId), tostring(rows[1].label):sub(1, 80)))
+  feedback(src, 'Spawn marker deleted.')
+end)
+
 RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
   local src = source
   if not canManage(src) or not databaseReady then return end
@@ -1331,6 +2367,11 @@ RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
     if flowMeta.hasPlayerActions and not IsPlayerAceAllowed(src, Config.Ace.playerActions) then
       return feedback(src, 'You need the Arachnid Storyteller player-action ACE permission to start this flow.')
     end
+    for family, required in pairs(flowMeta.featureFamilies or {}) do
+      if required and not IsPlayerAceAllowed(src, Config.Ace[family]) then
+        return feedback(src, ('You need the Arachnid Storyteller %s ACE permission to start this flow.'):format(family))
+      end
+    end
   end
   local actor = actorName(src)
   local actorIdentifier = GetPlayerIdentifierByType(src, 'license') or GetPlayerIdentifier(src, 0) or tostring(src)
@@ -1340,6 +2381,8 @@ RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
     scenes = story.scenes,
     sceneIndex = 1,
     audience = audience,
+    spawnPoints = story.spawnPoints or {},
+    entities = { npcs = {}, props = {} },
     startedAt = os.time(),
     startedBy = actor,
     startedBySource = src,
@@ -1355,9 +2398,13 @@ RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
       outgoing = flowMeta.outgoing,
       areas = flowMeta.areas,
       teleports = flowMeta.teleports,
-      currentNode = startId,
+      featureFamilies = flowMeta.featureFamilies,
+      spawnPoints = flowMeta.spawnPoints,
+      queue = { { nodeId = startId, inputPort = 'in' } },
+      waiters = {},
+      joinArrivals = {},
+      joinFired = {},
       variables = {},
-      waiting = nil,
       paused = false
     }
     activeSession.objective = { text = '', status = 'none', updatedAt = os.time(), updatedBy = actorName(src) }
@@ -1372,6 +2419,176 @@ RegisterNetEvent('arachnid_storyteller:sessionStart', function(raw)
   else
     feedback(src, 'Live session started at scene 1 of ' .. #story.scenes .. '.')
   end
+end)
+
+RegisterNetEvent('arachnid_storyteller:cutscenePreview', function(rawSceneId)
+  local src = source
+  if not canManage(src) then return end
+  if activeSession then return feedback(src, 'Local cutscene preview is available when no live session is active.') end
+  if Config.Cutscenes.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.cutscenes) then
+    return feedback(src, 'Cutscene playback is disabled or you lack the cutscenes ACE permission.')
+  end
+  local sceneId = positiveInteger(rawSceneId)
+  local scene = sceneId and MySQL.query.await('SELECT id,title FROM arachnid_storyteller_scenes WHERE id=? LIMIT 1', { sceneId }) or {}
+  scene = type(scene) == 'table' and scene[1] or nil
+  if not scene then return feedback(src, 'Choose an existing scene beat.') end
+  scene.cutscene_settings = sceneCutsceneSettings(sceneId)
+  local payload, reason = cutscenePayload(scene, scene.cutscene_settings)
+  if not payload then return feedback(src, reason) end
+  payload.localPreview = true
+  TriggerClientEvent('arachnid_storyteller:cutscenePlay', src, payload)
+  feedback(src, 'Local cutscene preview started.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:cutscenePreviewStop', function()
+  local src = source
+  if not canManage(src) or activeSession then return end
+  if Config.Cutscenes.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.cutscenes) then
+    return feedback(src, 'Cutscene playback is disabled or you lack the cutscenes ACE permission.')
+  end
+  TriggerClientEvent('arachnid_storyteller:cutsceneStop', src)
+  feedback(src, 'Local cutscene preview stopped.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionEncounterAction', function(raw)
+  local src = source
+  if not canManage(src) or not activeSession or type(raw) ~= 'table' then return end
+  if Config.Encounters.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.encounters) then
+    return feedback(src, 'Encounters are disabled or you lack the encounters ACE permission.')
+  end
+  local action = type(raw.action) == 'string' and raw.action or ''
+  local allowed = {
+    spawn_npc = true, spawn_npc_group = true, remove_npc = true, make_npc_hostile = true,
+    set_npc_target = true, patrol_route = true, spawn_prop = true, delete_prop = true
+  }
+  if not allowed[action] then return feedback(src, 'Choose a supported encounter action.') end
+  local data = {}
+  if action == 'spawn_npc' or action == 'spawn_npc_group' then
+    data.model = type(raw.model) == 'string' and raw.model or ''
+    data.spawnPointId = positiveInteger(raw.spawnPointId)
+    local modelEntry = allowedEncounterModel('ped', data.model)
+    data.health = boundedNumber(raw.health or 150, 1, maxPedHealth(modelEntry))
+    data.count = action == 'spawn_npc_group' and boundedNumber(raw.count, 1, Config.Encounters.maxGroupCount) or 1
+    if not modelEntry or not encounterMarker(activeSession, data.spawnPointId, 'npc') or
+      data.health == nil or data.health % 1 ~= 0 or data.count == nil or data.count % 1 ~= 0 then
+      return feedback(src, 'NPC model, spawn marker, count, or health is outside the configured limits.')
+    end
+  elseif action == 'spawn_prop' then
+    data.model = type(raw.model) == 'string' and raw.model or ''
+    data.spawnPointId = positiveInteger(raw.spawnPointId)
+    if not allowedEncounterModel('prop', data.model) or not encounterMarker(activeSession, data.spawnPointId, 'prop') then
+      return feedback(src, 'Prop model or spawn marker is not configured for this story.')
+    end
+  elseif action == 'set_npc_target' then
+    data.target = raw.target == 'all' and 'all' or raw.target == 'random' and 'random' or nil
+    if not data.target then return feedback(src, 'Choose all participants or one random participant as the NPC target.') end
+  elseif action == 'patrol_route' then
+    if not isDenseArray(raw.markerIds, 20) or #raw.markerIds < 2 then return feedback(src, 'Select at least two patrol waypoints.') end
+    data.markerIds = {}
+    for _, rawMarker in ipairs(raw.markerIds) do
+      local markerId = positiveInteger(rawMarker)
+      if not markerId or not encounterMarker(activeSession, markerId, 'patrol') then return feedback(src, 'A patrol waypoint does not belong to this story.') end
+      data.markerIds[#data.markerIds + 1] = markerId
+    end
+    data.waitSeconds = boundedNumber(raw.waitSeconds or 3, 1, Config.Encounters.maxPatrolWaitSeconds)
+    if not data.waitSeconds then return feedback(src, 'Patrol waypoint time exceeds the configured limit.') end
+  end
+  local ok, actionOk, reason = pcall(applyEncounterAction, activeSession, action, data)
+  if not ok or not actionOk then return feedback(src, 'Encounter action failed: ' .. tostring(ok and reason or actionOk)) end
+  logAction(src, ('Ran encounter action %s in story #%s'):format(action, tostring(activeSession.storyId)))
+  flowTick()
+  feedback(src, 'Encounter action completed.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionWorldAction', function(raw)
+  local src = source
+  if not canManage(src) or not activeSession or type(raw) ~= 'table' then return end
+  if Config.World.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.world) then
+    return feedback(src, 'World controls are disabled or you lack the world ACE permission.')
+  end
+  local targetId = type(raw.targetId) == 'string' and raw.targetId or ''
+  local action = type(raw.action) == 'string' and raw.action or ''
+  local supported = { open = true, close = true, lock = true, unlock = true, enable = true, disable = true, trigger = true }
+  if not supported[action] then return feedback(src, 'Choose a supported registered world operation.') end
+  local ok, actionOk, reason = pcall(applyWorldAction, activeSession, targetId, action)
+  if not ok or not actionOk then return feedback(src, 'World action failed: ' .. tostring(ok and reason or actionOk)) end
+  logAction(src, ('Ran registered world action %s on target %s in story #%s'):format(action, targetId, tostring(activeSession.storyId)))
+  feedback(src, 'World action completed.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionEffectAction', function(raw)
+  local src = source
+  if not canManage(src) or not activeSession or type(raw) ~= 'table' then return end
+  if Config.Effects.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.effects) then
+    return feedback(src, 'Audio and visual effects are disabled or you lack the effects ACE permission.')
+  end
+  local kind = type(raw.kind) == 'string' and raw.kind or ''
+  if not flowFeatureNodes.effects[kind] then return feedback(src, 'Choose a supported story effect.') end
+  local data, reason = normalizeEffectData(kind, raw.data)
+  if not data then return feedback(src, reason) end
+  local ok, actionOk, actionError = pcall(applyStoryEffect, activeSession, kind, data)
+  if not ok or not actionOk then return feedback(src, 'Story effect failed: ' .. tostring(ok and actionError or actionOk)) end
+  logAction(src, ('Ran session effect %s in story #%s'):format(kind, tostring(activeSession.storyId)))
+  feedback(src, 'Story effect sent to the connected session audience.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionCutscenePlay', function(rawSceneId)
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  if Config.Cutscenes.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.cutscenes) then
+    return feedback(src, 'Cutscene playback is disabled or you lack the cutscenes ACE permission.')
+  end
+  local sceneId = positiveInteger(rawSceneId)
+  if not sceneId then return feedback(src, 'Choose a valid scene beat.') end
+  local ok, reason = startSessionCutscene(activeSession, sceneId)
+  if not ok then return feedback(src, reason) end
+  logAction(src, ('Played cutscene for scene #%s in story #%s'):format(tostring(sceneId), tostring(activeSession.storyId)))
+  broadcastSession('cutscene_started')
+  feedback(src, 'Cutscene playback started for the live audience.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionCutscenePause', function()
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  if Config.Cutscenes.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.cutscenes) then
+    return feedback(src, 'Cutscene playback is disabled or you lack the cutscenes ACE permission.')
+  end
+  if activeSession.flowRuntime then return feedback(src, 'Pause the flow to pause its active cutscene.') end
+  if not activeSession.cutscene then return feedback(src, 'There is no active cutscene.') end
+  if activeSession.cutscene.paused then return feedback(src, 'The audience cutscene is already paused.') end
+  pauseSessionCutscene(activeSession)
+  logAction(src, ('Paused cutscene in story #%s'):format(tostring(activeSession.storyId)))
+  broadcastSession('cutscene_paused')
+  feedback(src, 'Cutscene paused for the live audience.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionCutsceneResume', function()
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  if Config.Cutscenes.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.cutscenes) then
+    return feedback(src, 'Cutscene playback is disabled or you lack the cutscenes ACE permission.')
+  end
+  if activeSession.flowRuntime then return feedback(src, 'Resume the flow to resume its active cutscene.') end
+  if not activeSession.cutscene then return feedback(src, 'There is no active cutscene.') end
+  if not activeSession.cutscene.paused then return feedback(src, 'The audience cutscene is already running.') end
+  resumeSessionCutscene(activeSession)
+  logAction(src, ('Resumed cutscene in story #%s'):format(tostring(activeSession.storyId)))
+  broadcastSession('cutscene_resumed')
+  feedback(src, 'Cutscene resumed for the live audience.')
+end)
+
+RegisterNetEvent('arachnid_storyteller:sessionCutsceneStop', function()
+  local src = source
+  if not canManage(src) or not activeSession then return end
+  if Config.Cutscenes.enabled ~= true or not IsPlayerAceAllowed(src, Config.Ace.cutscenes) then
+    return feedback(src, 'Cutscene playback is disabled or you lack the cutscenes ACE permission.')
+  end
+  if not activeSession.cutscene then return feedback(src, 'There is no active cutscene.') end
+  stopSessionCutscene(activeSession)
+  logAction(src, ('Stopped cutscene in story #%s'):format(tostring(activeSession.storyId)))
+  broadcastSession('cutscene_stopped')
+  flowTick()
+  feedback(src, 'Cutscene stopped.')
 end)
 
 RegisterNetEvent('arachnid_storyteller:sessionNext', function()
@@ -1418,10 +2635,13 @@ RegisterNetEvent('arachnid_storyteller:sessionPause', function()
   if not canManage(src) or not activeSession or not activeSession.flowRuntime then return end
   local runtime = activeSession.flowRuntime
   if runtime.paused then return feedback(src, 'The flow is already paused.') end
-  if runtime.waiting and runtime.waiting.kind == 'delay' and runtime.waiting.untilTime then
-    runtime.waiting.remaining = math.max(0, runtime.waiting.untilTime - GetGameTimer())
-    runtime.waiting.untilTime = nil
+  for _, waiting in ipairs(runtime.waiters) do
+    if waiting.kind == 'delay' and waiting.untilTime then
+      waiting.remaining = math.max(0, waiting.untilTime - GetGameTimer())
+      waiting.untilTime = nil
+    end
   end
+  pauseSessionCutscene(activeSession)
   runtime.paused = true
   logAction(src, ('Paused flow for live session #%s'):format(tostring(activeSession.storyId)))
   broadcastSession('flow_paused')
@@ -1433,10 +2653,13 @@ RegisterNetEvent('arachnid_storyteller:sessionResume', function()
   if not canManage(src) or not activeSession or not activeSession.flowRuntime then return end
   local runtime = activeSession.flowRuntime
   if not runtime.paused then return feedback(src, 'The flow is already running.') end
-  if runtime.waiting and runtime.waiting.kind == 'delay' and not runtime.waiting.untilTime then
-    runtime.waiting.untilTime = GetGameTimer() + (runtime.waiting.remaining or 0)
-    runtime.waiting.remaining = nil
+  for _, waiting in ipairs(runtime.waiters) do
+    if waiting.kind == 'delay' and not waiting.untilTime then
+      waiting.untilTime = GetGameTimer() + (waiting.remaining or 0)
+      waiting.remaining = nil
+    end
   end
+  resumeSessionCutscene(activeSession)
   runtime.paused = false
   runtime.error = nil
   logAction(src, ('Resumed flow for live session #%s'):format(tostring(activeSession.storyId)))
@@ -1529,8 +2752,11 @@ RegisterNetEvent('arachnid_storyteller:storyDelete', function(rawId)
     if type(rows) ~= 'table' or not rows[1] then return nil, 'That story no longer exists.' end
     MySQL.update.await([[DELETE points FROM arachnid_storyteller_camera_points AS points
       INNER JOIN arachnid_storyteller_scenes AS scenes ON scenes.id=points.scene_id WHERE scenes.story_id=?]], { id })
+    MySQL.update.await([[DELETE settings FROM arachnid_storyteller_cutscene_settings AS settings
+      INNER JOIN arachnid_storyteller_scenes AS scenes ON scenes.id=settings.scene_id WHERE scenes.story_id=?]], { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_flows WHERE story_id=?', { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_teleports WHERE story_id=?', { id })
+    MySQL.update.await('DELETE FROM arachnid_storyteller_spawn_points WHERE story_id=?', { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_scenes WHERE story_id=?', { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_stories WHERE id=?', { id })
     return rows[1].title
@@ -1607,6 +2833,7 @@ RegisterNetEvent('arachnid_storyteller:sceneDelete', function(rawId)
     local rows = MySQL.query.await('SELECT story_id,title FROM arachnid_storyteller_scenes WHERE id=? LIMIT 1', { id })
     if type(rows) ~= 'table' or not rows[1] then return nil, 'That scene no longer exists.' end
     MySQL.update.await('DELETE FROM arachnid_storyteller_camera_points WHERE scene_id=?', { id })
+    MySQL.update.await('DELETE FROM arachnid_storyteller_cutscene_settings WHERE scene_id=?', { id })
     MySQL.update.await('DELETE FROM arachnid_storyteller_scenes WHERE id=?', { id })
     MySQL.update.await('UPDATE arachnid_storyteller_stories SET updated_by=? WHERE id=?', { actor, rows[1].story_id })
     return rows[1]
@@ -1624,5 +2851,9 @@ CreateThread(function()
 end)
 
 AddEventHandler('onResourceStop', function(resource)
-  if resource == GetCurrentResourceName() then cleanupOwnedFreezes(nil) end
+  if resource == GetCurrentResourceName() then
+    if activeSession then endActiveSession('ended', nil) end
+    cleanupOwnedFreezes(nil)
+    cleanupAllEncounterEntities()
+  end
 end)
